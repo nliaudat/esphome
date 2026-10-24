@@ -35,7 +35,7 @@ from esphome.core import CORE
 import esphome.final_validate as fv
 from esphome.types import ConfigType
 
-from . import (
+from . import (  # noqa: F401  # pylint: disable=unused-import
     ADC_LIMIT_MARGIN_V,
     CONF_ADC_ATTENUATION,
     CONF_ADC_INPUT_MAX,
