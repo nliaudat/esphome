@@ -35,6 +35,8 @@ using GetRequest = std::array<uint8_t, GET_REQUEST_LEN>;
 static constexpr size_t MAX_SET_VALUE_LEN = 8;
 static constexpr size_t MAX_SET_REQUEST_LEN = GET_REQUEST_LEN + MAX_SET_VALUE_LEN;
 using SetRequest = std::array<uint8_t, MAX_SET_REQUEST_LEN>;
+// The main loop runs every 16 ms, so a shorter spacing between two refresh GETs is not achievable
+static constexpr uint32_t REFRESH_INTERVAL_MIN_MS = 16;
 
 // Shared entity base. update() fires the GET wired up by the hub.
 class TopTronicBase : public PollingComponent {
@@ -157,6 +159,7 @@ class TopTronic : public Component
 #endif
 {
  public:
+  // Also registers the hub for refresh_all(), before any setup() runs
   TopTronic(canbus::Canbus *canbus, uint16_t device_id);
 
   void add_sensor(TopTronicBase *sensor);
@@ -165,11 +168,27 @@ class TopTronic : public Component
   /// Sends a SET request for an input after the write guards.
   /// Returns whether the bus accepted it: paused, rate limited, rejected or failed return false.
   bool write(TopTronicInput *input, const uint8_t *data, size_t len);
+  // Queues a GET for every sensor, sent one at a time with retries (see the refresh setters)
+  void update_all();
+  // Runs update_all() on every hub, one hub every REFRESH_STAGGER_MS. With boot set, hubs that
+  // disabled the boot refresh (boot_refresh_delay: 0) are skipped.
+  void refresh_all(bool boot = false);
   void setup() override;
+  void loop() override;
   void dump_config() override;
 #ifdef USE_OTA_STATE_LISTENER
   void on_ota_global_state(ota::OTAState state, float progress, uint8_t error, ota::OTAComponent *component) override;
 #endif
+
+  // Delay before the one-shot refresh_all() after boot; 0 disables it for this hub
+  void set_boot_refresh_delay_ms(uint32_t ms) { this->boot_refresh_delay_ms_ = ms; }
+  // Spacing between two refresh GETs, clamped to the loop period
+  void set_refresh_interval_ms(uint32_t ms) {
+    this->refresh_interval_ms_ = std::max<uint32_t>(ms, REFRESH_INTERVAL_MIN_MS);
+  }
+  // An unanswered GET is sent again after refresh_retry_interval, at most max_refresh_retries times
+  void set_max_refresh_retries(uint8_t retries) { this->max_refresh_retries_ = retries; }
+  void set_refresh_retry_interval_ms(uint32_t ms) { this->refresh_retry_interval_ms_ = ms; }
 
   // Reassembly limits; each is clamped to the storage the build reserved for the largest hub
   void set_max_pending_messages(uint8_t max_pending_messages) {
@@ -209,6 +228,21 @@ class TopTronic : public Component
   static constexpr size_t NUM_SLOTS = 2;
 #endif
 
+  // refresh_all() covers every hub of the build
+#ifdef TOPTRONIC_HUB_COUNT
+  static constexpr size_t MAX_HUBS = TOPTRONIC_HUB_COUNT;
+#else
+  static constexpr size_t MAX_HUBS = 4;
+#endif
+  static StaticVector<TopTronic *, MAX_HUBS> hubs;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+  static bool boot_refresh_done;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+  struct RefreshEntry {
+    TopTronicBase *sensor;
+    uint32_t last_send_ms;
+    uint8_t attempts;  // GETs sent for this sensor in the current refresh
+  };
+
   struct Slot {
     uint32_t last_update_ms;
     uint8_t len;
@@ -229,21 +263,37 @@ class TopTronic : public Component
   bool parse_frame_(const uint8_t *data, size_t size, uint32_t can_id, const uint8_t **msg, size_t *len);
   void interpret_message_(const uint8_t *data, size_t len);
   void link_inputs_();
+  void drain_refresh_();
+  void finish_refresh_(bool stalled);
+  void remove_refresh_entry_(TopTronicBase *sensor);
   TopTronicBase *get_sensor_(uint32_t sensor_id);
 
   canbus::Canbus *canbus_;
   std::unordered_map<uint32_t, TopTronicBase *> sensors_;
   std::unordered_map<uint32_t, TopTronicInput *> inputs_;
   std::array<Slot, NUM_SLOTS> slots_{};
+  // Sensors whose refresh GET is still unanswered, oldest send first; sized in setup()
+  FixedVector<RefreshEntry> refresh_queue_;
   // A pending message with no frame for this long is treated as lost
   uint32_t max_pending_age_ms_{5000};
   uint32_t write_min_interval_ms_{2000};
+  uint32_t boot_refresh_delay_ms_{30000};
+  uint32_t refresh_interval_ms_{50};
+  uint32_t refresh_retry_interval_ms_{200};
+  uint32_t last_refresh_send_ms_{0};
+  uint32_t last_refresh_progress_ms_{0};
+  uint16_t refresh_queued_{0};
+  uint16_t refresh_answered_{0};
+  uint16_t refresh_dropped_{0};
   uint8_t msg_counter_{0};  // frame tag of the last multi-frame message sent by this hub
   uint16_t device_id_;
   uint8_t max_pending_messages_{NUM_SLOTS};
   uint8_t max_frames_per_message_{MAX_FRAMES_PER_MESSAGE};
+  uint8_t max_refresh_retries_{1};
   bool reject_writes_before_read_{true};
   bool paused_{false};
+  bool refresh_in_progress_{false};
+  bool refresh_requested_{false};  // update_all() during a refresh runs again once it ends
 };
 
 }  // namespace esphome::toptronic

@@ -31,6 +31,13 @@ CONF_MAX_FRAMES_PER_MESSAGE = "max_frames_per_message"
 CONF_MAX_PENDING_AGE = "max_pending_age"
 CONF_WRITE_MIN_INTERVAL = "write_min_interval"
 CONF_REJECT_WRITES_BEFORE_READ = "reject_writes_before_read"
+CONF_BOOT_REFRESH_DELAY = "boot_refresh_delay"
+CONF_REFRESH_INTERVAL = "refresh_interval"
+CONF_MAX_REFRESH_RETRIES = "max_refresh_retries"
+CONF_REFRESH_RETRY_INTERVAL = "refresh_retry_interval"
+
+# The main loop runs every 16 ms, so a shorter GET spacing is not achievable
+REFRESH_INTERVAL_MIN_MS = 16
 
 # Platforms that read a datapoint: one entity per datapoint per hub, or the first would never be polled
 READ_DOMAINS = ("sensor", "text_sensor")
@@ -154,12 +161,27 @@ CONFIG_SCHEMA = cv.Schema(
         ): cv.positive_time_period_milliseconds,
         # Refuse writes to a datapoint that has not answered a read since boot
         cv.Optional(CONF_REJECT_WRITES_BEFORE_READ, default=True): cv.boolean,
+        # One-shot refresh of every hub after boot; 0s disables it
+        cv.Optional(
+            CONF_BOOT_REFRESH_DELAY, default="30s"
+        ): cv.positive_time_period_milliseconds,
+        # Spacing between two refresh GETs; the loop itself cannot go faster than its 16 ms period
+        cv.Optional(CONF_REFRESH_INTERVAL, default="50ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(min=cv.TimePeriod(milliseconds=REFRESH_INTERVAL_MIN_MS)),
+        ),
+        # How often an unanswered refresh GET is sent again, and after how long
+        cv.Optional(CONF_MAX_REFRESH_RETRIES, default=1): cv.int_range(min=0, max=10),
+        cv.Optional(
+            CONF_REFRESH_RETRY_INTERVAL, default="200ms"
+        ): cv.positive_time_period_milliseconds,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
 # Reassembly storage is sized for the largest hub
 _request_slot = cg.slot_counter("TOPTRONIC_SLOTS")
 _request_frame = cg.slot_counter("TOPTRONIC_MAX_FRAMES")
+_request_hub = cg.slot_counter("TOPTRONIC_HUB_COUNT")
 
 
 def _final_validate(config: ConfigType) -> None:
@@ -350,6 +372,7 @@ async def to_code(config: ConfigType) -> None:
     device_id = DEVICE_TYPES[config[CONF_DEVICE_TYPE]] | config[CONF_DEVICE_ADDR]
     var = cg.new_Pvariable(config[CONF_ID], cbus, device_id)
     await cg.register_component(var, config)
+    _request_hub()
     # Pause bus traffic while an OTA update runs
     ota.request_ota_state_listeners()
     max_pending = config[CONF_MAX_PENDING_MESSAGES]
@@ -363,4 +386,8 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_max_pending_age_ms(config[CONF_MAX_PENDING_AGE]))
     cg.add(var.set_write_min_interval_ms(config[CONF_WRITE_MIN_INTERVAL]))
     cg.add(var.set_reject_writes_before_read(config[CONF_REJECT_WRITES_BEFORE_READ]))
+    cg.add(var.set_boot_refresh_delay_ms(config[CONF_BOOT_REFRESH_DELAY]))
+    cg.add(var.set_refresh_interval_ms(config[CONF_REFRESH_INTERVAL]))
+    cg.add(var.set_max_refresh_retries(config[CONF_MAX_REFRESH_RETRIES]))
+    cg.add(var.set_refresh_retry_interval_ms(config[CONF_REFRESH_RETRY_INTERVAL]))
     await _generate_entities(var, config)

@@ -8,6 +8,10 @@ toptronic:
     max_pending_age: 6s
     write_min_interval: 3s
     reject_writes_before_read: false
+    boot_refresh_delay: 20s
+    refresh_interval: 60ms
+    max_refresh_retries: 0
+    refresh_retry_interval: 250ms
 
 # The hub pauses CAN traffic while an OTA update runs, so the listener path must compile
 wifi:

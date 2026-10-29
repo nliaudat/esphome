@@ -31,6 +31,12 @@ static constexpr size_t CAN_FRAME_LEN = 8;
 static constexpr uint16_t GATEWAY_DEVICE_TYPE = 1152;  // GW
 // Device types are 64 apart, so the low 6 bits of a device id are its address
 static constexpr uint16_t DEVICE_ADDR_MASK = 0x3F;
+// refresh_all() starts one hub's refresh this long after the previous one
+static constexpr uint32_t REFRESH_STAGGER_MS = 15000;
+// A refresh with no GET sent or answered for this long plus the retry interval is abandoned
+static constexpr uint32_t REFRESH_STALL_TIMEOUT_MS = 5000;
+static constexpr uint32_t BOOT_REFRESH_TIMEOUT_ID = 0;
+static constexpr uint32_t REFRESH_ALL_TIMEOUT_ID = 1;
 static_assert((GATEWAY_DEVICE_TYPE & DEVICE_ADDR_MASK) == 0, "gateway type must leave the address bits clear");
 
 static constexpr uint16_t sender_id(uint32_t can_id) { return (can_id >> 11) & 0x7FF; }
@@ -61,7 +67,13 @@ static constexpr size_t build_set_request(uint8_t function_group, uint8_t functi
   return GET_REQUEST_LEN + value_len;
 }
 
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+StaticVector<TopTronic *, TopTronic::MAX_HUBS> TopTronic::hubs;
+bool TopTronic::boot_refresh_done{false};
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
 TopTronic::TopTronic(canbus::Canbus *canbus, uint16_t device_id) : canbus_(canbus), device_id_(device_id) {
+  hubs.push_back(this);
   canbus->add_callback([this](uint32_t can_id, bool extended_id, bool rtr, const std::vector<uint8_t> &data) {
     // A remote frame has no payload; the bytes passed with it are left over from an earlier frame
     if (rtr || this->paused_ || !extended_id || sender_id(can_id) != this->device_id_)
@@ -308,6 +320,112 @@ bool TopTronic::write(TopTronicInput *input, const uint8_t *data, size_t len) {
   return true;
 }
 
+void TopTronic::update_all() {
+  if (this->refresh_in_progress_) {
+    this->refresh_requested_ = true;
+    ESP_LOGD(TAG, "Hub 0x%04X refresh in progress (%zu pending), running again after it", (unsigned) this->device_id_,
+             this->refresh_queue_.size());
+    return;
+  }
+  this->refresh_queue_.clear();
+  for (const auto &s : this->sensors_)
+    this->refresh_queue_.push_back(RefreshEntry{s.second, 0, 0});
+  this->refresh_in_progress_ = true;
+  this->refresh_queued_ = static_cast<uint16_t>(this->refresh_queue_.size());
+  this->refresh_answered_ = 0;
+  this->refresh_dropped_ = 0;
+  this->last_refresh_progress_ms_ = App.get_loop_component_start_time();
+  ESP_LOGI(TAG, "Hub 0x%04X refresh requested (%u sensors)%s", (unsigned) this->device_id_,
+           (unsigned) this->refresh_queued_, this->paused_ ? LOG_STR_LITERAL(", paused") : LOG_STR_LITERAL(""));
+  this->enable_loop();
+}
+
+void TopTronic::refresh_all(bool boot) {
+  size_t sensors = 0;
+  size_t hubs_seen = 0;
+  for (TopTronic *hub : hubs) {
+    if (boot && hub->boot_refresh_delay_ms_ == 0)
+      continue;  // this hub asked to stay out of the boot refresh
+    sensors += hub->sensors_.size();
+    hubs_seen++;
+  }
+  ESP_LOGI(TAG, "Refreshing %zu hub(s), %zu sensors, %" PRIu32 " s apart", hubs_seen, sensors,
+           REFRESH_STAGGER_MS / 1000);
+  uint32_t offset = 0;
+  for (TopTronic *hub : hubs) {
+    if (boot && hub->boot_refresh_delay_ms_ == 0)
+      continue;
+    if (offset == 0) {
+      hub->update_all();
+    } else {
+      hub->set_timeout(REFRESH_ALL_TIMEOUT_ID, offset, [hub]() { hub->update_all(); });
+    }
+    offset += REFRESH_STAGGER_MS;
+  }
+}
+
+// Sends the GET at the head of the queue once the spacing has passed and, for a retry, once the retry interval
+// has passed. A sent entry moves to the back, so the head is always the one sent longest ago.
+void TopTronic::drain_refresh_() {
+  if (!this->refresh_in_progress_ || this->paused_)
+    return;
+  const uint32_t now = App.get_loop_component_start_time();
+  if (!this->refresh_queue_.empty() && now - this->last_refresh_send_ms_ >= this->refresh_interval_ms_) {
+    RefreshEntry entry = this->refresh_queue_.front();
+    if (entry.attempts == 0 || now - entry.last_send_ms >= this->refresh_retry_interval_ms_) {
+      std::copy(this->refresh_queue_.begin() + 1, this->refresh_queue_.end(), this->refresh_queue_.begin());
+      this->refresh_queue_.pop_back();
+      if (entry.attempts > this->max_refresh_retries_) {
+        // The regular poll still covers a sensor that never answered
+        this->refresh_dropped_++;
+        ESP_LOGD(TAG, "[GET] %s unanswered after %u tries", LOG_STR_ARG(entry.sensor->get_log_name()), entry.attempts);
+      } else {
+        if (entry.attempts > 0) {
+          ESP_LOGD(TAG, "[GET] %s retry %u/%u", LOG_STR_ARG(entry.sensor->get_log_name()), entry.attempts,
+                   this->max_refresh_retries_);
+        }
+        entry.last_send_ms = now;
+        entry.attempts++;
+        this->refresh_queue_.push_back(entry);
+        entry.sensor->update();
+      }
+      this->last_refresh_send_ms_ = now;
+      this->last_refresh_progress_ms_ = now;
+    }
+  }
+  if (this->refresh_queue_.empty()) {
+    this->finish_refresh_(false);
+  } else if (now - this->last_refresh_progress_ms_ >= REFRESH_STALL_TIMEOUT_MS + this->refresh_retry_interval_ms_) {
+    ESP_LOGW(TAG, "Hub 0x%04X refresh stalled with %zu sensors pending, abandoning it", (unsigned) this->device_id_,
+             this->refresh_queue_.size());
+    this->refresh_dropped_ += this->refresh_queue_.size();
+    this->refresh_queue_.clear();
+    this->finish_refresh_(true);
+  }
+}
+
+void TopTronic::finish_refresh_(bool stalled) {
+  this->refresh_in_progress_ = false;
+  ESP_LOGI(TAG, "Hub 0x%04X refresh finished%s: %u queued, %u answered, %u dropped", (unsigned) this->device_id_,
+           stalled ? LOG_STR_LITERAL(" (stalled)") : LOG_STR_LITERAL(""), (unsigned) this->refresh_queued_,
+           (unsigned) this->refresh_answered_, (unsigned) this->refresh_dropped_);
+  if (this->refresh_requested_) {
+    this->refresh_requested_ = false;
+    this->update_all();
+  }
+}
+
+void TopTronic::remove_refresh_entry_(TopTronicBase *sensor) {
+  auto *it = std::find_if(this->refresh_queue_.begin(), this->refresh_queue_.end(),
+                          [sensor](const RefreshEntry &entry) { return entry.sensor == sensor; });
+  if (it == this->refresh_queue_.end())
+    return;
+  std::copy(it + 1, this->refresh_queue_.end(), it);
+  this->refresh_queue_.pop_back();
+  this->refresh_answered_++;
+  this->last_refresh_progress_ms_ = App.get_loop_component_start_time();
+}
+
 TopTronicBase *TopTronic::get_sensor_(uint32_t sensor_id) {
   auto it = this->sensors_.find(sensor_id);
   return it == this->sensors_.end() ? nullptr : it->second;
@@ -355,6 +473,8 @@ void TopTronic::pause() {
 
 void TopTronic::resume() {
   this->paused_ = false;
+  // Time spent paused does not count towards the refresh stall timeout
+  this->last_refresh_progress_ms_ = App.get_loop_component_start_time();
   ESP_LOGI(TAG, "Hub 0x%04X resumed", (unsigned) this->device_id_);
 }
 
@@ -362,11 +482,27 @@ void TopTronic::setup() {
   // Wire the callbacks here, after every platform's add_sensor()/add_input() has run.
   this->link_inputs_();
   this->register_sensor_callbacks();
+  this->refresh_queue_.init(this->sensors_.size());
+  if (this->boot_refresh_delay_ms_ != 0) {
+    // Every hub arms its own delay; the first to expire refreshes all of them
+    this->set_timeout(BOOT_REFRESH_TIMEOUT_ID, this->boot_refresh_delay_ms_, [this]() {
+      if (!boot_refresh_done) {
+        boot_refresh_done = true;
+        this->refresh_all(true);
+      }
+    });
+  }
 #ifdef USE_OTA_STATE_LISTENER
   ota::get_global_ota_callback()->add_global_state_listener(this);
 #endif
   ESP_LOGI(TAG, "Hub 0x%04X (%zu sensors, %zu inputs)", (unsigned) this->device_id_, this->sensors_.size(),
            this->inputs_.size());
+}
+
+void TopTronic::loop() {
+  this->drain_refresh_();
+  if (!this->refresh_in_progress_)
+    this->disable_loop();
 }
 
 #ifdef USE_OTA_STATE_LISTENER
@@ -391,6 +527,10 @@ void TopTronic::dump_config() {
   ESP_LOGCONFIG(TAG, "  Max pending age: %u ms", (unsigned) this->max_pending_age_ms_);
   ESP_LOGCONFIG(TAG, "  Write safety: min SET interval %" PRIu32 " ms, reject writes before read: %s",
                 this->write_min_interval_ms_, YESNO(this->reject_writes_before_read_));
+  ESP_LOGCONFIG(TAG,
+                "  Refresh: boot delay %" PRIu32 " ms, one GET every %" PRIu32 " ms, %u retries after %" PRIu32 " ms",
+                this->boot_refresh_delay_ms_, this->refresh_interval_ms_, this->max_refresh_retries_,
+                this->refresh_retry_interval_ms_);
 }
 
 bool TopTronic::parse_frame_(const uint8_t *data, size_t size, uint32_t can_id, const uint8_t **msg, size_t *len) {
@@ -528,6 +668,8 @@ void TopTronic::interpret_message_(const uint8_t *data, size_t len) {
     return;
   }
   sensor_base->mark_read();
+  if (this->refresh_in_progress_)
+    this->remove_refresh_entry_(sensor_base);
   ESP_LOGD_HEX(TAG, data, len, MAX_MESSAGE_LEN, "[RES] %s Data: %s", LOG_STR_ARG(sensor_base->get_log_name()));
   if (sensor_base->type() == SENSOR) {
     auto *sensor = static_cast<TopTronicSensor *>(sensor_base);

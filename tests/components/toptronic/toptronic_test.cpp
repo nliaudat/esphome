@@ -68,6 +68,12 @@ class TestableTopTronic : public TopTronic {
   }
 
   void interpret(const std::vector<uint8_t> &msg) { this->interpret_message_(msg.data(), msg.size()); }
+  void drain() { this->drain_refresh_(); }
+  bool refreshing() const { return this->refresh_in_progress_; }
+  static void forget_hubs() {
+    hubs.clear();
+    boot_refresh_done = false;
+  }
 
   size_t live_slots(uint32_t now) const {
     size_t n = 0;
@@ -79,6 +85,8 @@ class TestableTopTronic : public TopTronic {
 
 class TopTronicTest : public ::testing::Test {
  protected:
+  void TearDown() override { TestableTopTronic::forget_hubs(); }
+
   void set_now_(uint32_t now) {
     this->now_ = now;
     LoopBlockingGuard{nullptr, nullptr, now};
@@ -446,6 +454,152 @@ TEST_F(TopTronicTest, PausedHubDoesNotPoll) {
   EXPECT_EQ(this->bus_.sent.size(), 1u);
 }
 #endif
+#endif
+
+#ifdef USE_SENSOR
+class TopTronicRefreshTest : public TopTronicTest {
+ protected:
+  void SetUp() override {
+    this->set_now_(1000);
+    uint16_t datapoint = 0x0010;
+    for (auto &sensor : this->sensors_) {
+      sensor.set_function_group(0x01);
+      sensor.set_function_number(0x02);
+      sensor.set_datapoint(datapoint++);
+      sensor.set_type(U8);
+      this->hub_.add_sensor(&sensor);
+    }
+    this->hub_.set_boot_refresh_delay_ms(0);
+    this->hub_.set_refresh_interval_ms(50);
+    this->hub_.setup();
+  }
+
+  void answer_(uint16_t datapoint) {
+    this->hub_.interpret({0x42, 0x01, 0x02, static_cast<uint8_t>(datapoint >> 8), static_cast<uint8_t>(datapoint), 1});
+  }
+
+  // Answers the datapoint of the last GET sent
+  void answer_last_() {
+    const auto &frame = this->bus_.last_sent;
+    this->answer_(encode_uint16(frame.data[4], frame.data[5]));
+  }
+
+  void drain_at_(uint32_t now) {
+    this->set_now_(now);
+    this->hub_.drain();
+  }
+
+  TopTronicSensor sensors_[2];
+};
+
+TEST_F(TopTronicRefreshTest, GetsAreSpacedAndAnsweredSensorsLeaveTheQueue) {
+  this->hub_.update_all();
+  EXPECT_TRUE(this->hub_.refreshing());
+  this->drain_at_(1000);
+  EXPECT_EQ(this->bus_.sent.size(), 1u);
+  this->drain_at_(1040);
+  EXPECT_EQ(this->bus_.sent.size(), 1u);
+  this->drain_at_(1050);
+  EXPECT_EQ(this->bus_.sent.size(), 2u);
+  this->answer_(0x0010);
+  this->answer_(0x0011);
+  this->drain_at_(1100);
+  EXPECT_FALSE(this->hub_.refreshing());
+  EXPECT_EQ(this->bus_.sent.size(), 2u);
+}
+
+TEST_F(TopTronicRefreshTest, UnansweredGetIsRetriedThenDropped) {
+  // The setter clamps below the 16 ms loop period, so 16 ms is the shortest spacing a test can use
+  this->hub_.set_refresh_interval_ms(16);
+  this->hub_.set_max_refresh_retries(1);
+  this->hub_.set_refresh_retry_interval_ms(200);
+  this->hub_.update_all();
+  this->drain_at_(1000);
+  this->drain_at_(1016);
+  EXPECT_EQ(this->bus_.sent.size(), 2u);
+  // The head of the queue waits for its retry interval
+  this->drain_at_(1100);
+  EXPECT_EQ(this->bus_.sent.size(), 2u);
+  this->drain_at_(1200);
+  this->drain_at_(1216);
+  EXPECT_EQ(this->bus_.sent.size(), 4u);
+  // Out of retries: both are dropped without another GET
+  this->drain_at_(1400);
+  this->drain_at_(1416);
+  EXPECT_EQ(this->bus_.sent.size(), 4u);
+  EXPECT_FALSE(this->hub_.refreshing());
+}
+
+TEST_F(TopTronicRefreshTest, RefreshRequestedDuringARefreshRunsAfterIt) {
+  this->hub_.update_all();
+  this->drain_at_(1000);
+  this->hub_.update_all();
+  this->answer_last_();
+  this->drain_at_(1050);
+  this->answer_last_();
+  EXPECT_EQ(this->bus_.sent.size(), 2u);
+  // The queue emptied, so the deferred refresh starts and sends again
+  this->drain_at_(1100);
+  EXPECT_TRUE(this->hub_.refreshing());
+  this->drain_at_(1150);
+  EXPECT_EQ(this->bus_.sent.size(), 3u);
+}
+
+TEST_F(TopTronicRefreshTest, PausedRefreshWaitsAndStalledRefreshIsAbandoned) {
+  this->hub_.set_max_refresh_retries(10);
+  this->hub_.update_all();
+  this->hub_.pause();
+  this->drain_at_(1000);
+  this->drain_at_(20000);
+  EXPECT_TRUE(this->bus_.sent.empty());
+  EXPECT_TRUE(this->hub_.refreshing());
+  this->hub_.resume();
+  this->drain_at_(20000);
+  EXPECT_EQ(this->bus_.sent.size(), 1u);
+  // Nothing sent or answered for 5 s plus the retry interval abandons the refresh
+  this->hub_.set_refresh_interval_ms(1000000);
+  this->drain_at_(25199);
+  EXPECT_TRUE(this->hub_.refreshing());
+  this->drain_at_(25200);
+  EXPECT_FALSE(this->hub_.refreshing());
+  EXPECT_EQ(this->bus_.sent.size(), 1u);
+}
+
+TEST_F(TopTronicRefreshTest, RefreshAllStartsTheFirstHubAndDelaysTheRest) {
+  NullCanbus bus2;
+  TestableTopTronic hub2(&bus2);
+  TopTronicSensor sensor2;
+  sensor2.set_function_group(0x01);
+  sensor2.set_function_number(0x02);
+  sensor2.set_datapoint(0x0010);
+  sensor2.set_type(U8);
+  hub2.add_sensor(&sensor2);
+  hub2.set_boot_refresh_delay_ms(0);
+  hub2.setup();
+  this->hub_.refresh_all();
+  EXPECT_TRUE(this->hub_.refreshing());
+  EXPECT_FALSE(hub2.refreshing());
+  hub2.drain();
+  EXPECT_TRUE(bus2.sent.empty());
+}
+
+TEST_F(TopTronicRefreshTest, BootRefreshSkipsHubsThatDisabledIt) {
+  NullCanbus bus2;
+  TestableTopTronic hub2(&bus2);
+  TopTronicSensor sensor2;
+  sensor2.set_function_group(0x01);
+  sensor2.set_function_number(0x02);
+  sensor2.set_datapoint(0x0010);
+  sensor2.set_type(U8);
+  hub2.add_sensor(&sensor2);
+  // This hub opted out of the boot refresh; the other one kept the default delay
+  hub2.set_boot_refresh_delay_ms(0);
+  hub2.setup();
+  this->hub_.set_boot_refresh_delay_ms(30000);
+  this->hub_.refresh_all(true);
+  EXPECT_TRUE(this->hub_.refreshing());
+  EXPECT_FALSE(hub2.refreshing());
+}
 #endif
 
 #ifdef USE_TEXT_SENSOR
