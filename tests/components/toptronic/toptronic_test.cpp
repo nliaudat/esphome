@@ -33,6 +33,8 @@ class NullCanbus : public canbus::Canbus {
   canbus::CanFrame last_sent{};
   std::vector<canbus::CanFrame> sent;
   bool fail{false};
+  // Lets a test count the callbacks a hub registered on this bus
+  size_t callback_count() const { return this->callback_manager_.size(); }
 
  protected:
   bool setup_internal() override { return true; }
@@ -73,7 +75,17 @@ class TestableTopTronic : public TopTronic {
   static void forget_hubs() {
     hubs.clear();
     boot_refresh_done = false;
+    debug_logs = {};
+    last_candump_log_ms = 0;
+    candump_dropped = 0;
   }
+  static void log_frame(uint32_t can_id, const std::vector<uint8_t> &frame, bool sent) {
+    log_debug_frame(can_id, frame.data(), frame.size(), sent);
+  }
+  static bool single_frame(uint32_t can_id, const std::vector<uint8_t> &frame) {
+    return is_single_frame_message(can_id, frame.data(), frame.size());
+  }
+  static uint32_t dropped() { return candump_dropped; }
 
   size_t live_slots(uint32_t now) const {
     size_t n = 0;
@@ -118,6 +130,12 @@ class TopTronicTest : public ::testing::Test {
   TestableTopTronic hub_{&this->bus_};
   uint32_t now_{1000};
 };
+
+#ifdef USE_SWITCH
+// What switch.py generates: the switch forwards to the hub, which publishes the state
+void apply_candump(switch_::Switch *, bool state) { TopTronic::set_candump_enabled(state); }
+void apply_find_can_id(switch_::Switch *, bool state) { TopTronic::set_find_can_id_enabled(state); }
+#endif
 
 const std::vector<uint8_t> MESSAGE{0x42, 0x01, 0x02, 0x00, 0x10, 0xAA, 0xBB, 0xCC, 0xDD};
 
@@ -613,6 +631,124 @@ TEST_F(TopTronicTest, ResponsePublishesTheMatchingTextOption) {
   this->hub_.add_sensor(&sensor);
   this->hub_.interpret({0x42, 0x01, 0x02, 0x00, 0x10, 0x01});
   EXPECT_EQ(sensor.state, "On");
+}
+#endif
+
+TEST_F(TopTronicTest, CandumpRateLimitsReceivedFramesButNotSentFrames) {
+  this->set_now_(1000);
+  TestableTopTronic::set_candump_enabled(true);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  EXPECT_EQ(TestableTopTronic::dropped(), 0u);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  this->set_now_(1020);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  EXPECT_EQ(TestableTopTronic::dropped(), 2u);
+  // A sent frame is always logged and reports the skipped frames
+  TestableTopTronic::log_frame(START_ID, {0x01, 0x40}, true);
+  EXPECT_EQ(TestableTopTronic::dropped(), 0u);
+  this->set_now_(1033);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  EXPECT_EQ(TestableTopTronic::dropped(), 0u);
+}
+
+TEST_F(TopTronicTest, DebugLogsTurnOffOnTheFramePathAfterTwoMinutes) {
+  this->set_now_(1000);
+  TestableTopTronic::set_candump_enabled(true);
+  TestableTopTronic::set_find_can_id_enabled(true);
+  this->set_now_(121000);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  EXPECT_TRUE(TestableTopTronic::is_candump_enabled());
+  EXPECT_TRUE(TestableTopTronic::is_find_can_id_enabled());
+  this->set_now_(121001);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  EXPECT_FALSE(TestableTopTronic::is_candump_enabled());
+  EXPECT_FALSE(TestableTopTronic::is_find_can_id_enabled());
+}
+
+TEST_F(TopTronicTest, SentFramesAreLoggedWhileCandumpIsOn) {
+  this->set_now_(1000);
+  TestableTopTronic::set_candump_enabled(true);
+  // Two sent frames in the same tick are both logged, so nothing counts as skipped
+  TestableTopTronic::log_frame(START_ID, {0x01, 0x40}, true);
+  TestableTopTronic::log_frame(START_ID, {0x01, 0x40}, true);
+  EXPECT_EQ(TestableTopTronic::dropped(), 0u);
+  this->set_now_(130000);
+  TestableTopTronic::log_frame(START_ID, {0x01, 0x40}, true);
+  EXPECT_FALSE(TestableTopTronic::is_candump_enabled());
+}
+
+TEST_F(TopTronicTest, OneDebugFrameLoggerPerCanBus) {
+  // The fixture hub added the frame logger and its own receive callback
+  EXPECT_EQ(this->bus_.callback_count(), 2u);
+  TestableTopTronic same_bus_hub{&this->bus_};
+  // A second hub on the same bus adds only its receive callback
+  EXPECT_EQ(this->bus_.callback_count(), 3u);
+  NullCanbus other_bus;
+  TestableTopTronic other_bus_hub{&other_bus};
+  // A hub on another bus gets its own logger, or frames there would never be logged
+  EXPECT_EQ(other_bus.callback_count(), 2u);
+}
+
+TEST_F(TopTronicTest, FindCanIdOnlyMatchesSingleFrameMessages) {
+  // Only a single frame message holds a command at [1]
+  EXPECT_TRUE(TestableTopTronic::single_frame(START_ID, {0x00, 0x42}));
+  EXPECT_TRUE(TestableTopTronic::single_frame(START_ID, {0x00, 0x40}));
+  // A multi-frame start frame holds the message tag there, which can be 0x40 or 0x42 by chance
+  EXPECT_FALSE(TestableTopTronic::single_frame(START_ID, {0x10, 0x42}));
+  // A continuation frame holds an arbitrary payload byte
+  EXPECT_FALSE(TestableTopTronic::single_frame(CONT_ID, {TAG, 0x42}));
+  // A one byte frame cannot hold a command
+  EXPECT_FALSE(TestableTopTronic::single_frame(START_ID, {0x00}));
+}
+
+#ifdef USE_SWITCH
+TEST_F(TopTronicTest, SetupPublishesTheDebugSwitchState) {
+  NullCanbus other_bus;
+  TestableTopTronic other_hub{&other_bus};
+  switch_::ApplySwitch<apply_candump> candump_a;
+  switch_::ApplySwitch<apply_candump> candump_b;
+  this->hub_.set_candump_switch(&candump_a);
+  other_hub.set_candump_switch(&candump_b);
+  EXPECT_FALSE(candump_a.has_state());
+  EXPECT_FALSE(candump_b.has_state());
+
+  this->hub_.setup();
+  // Every switch of the build reports the boot state instead of staying unknown
+  EXPECT_TRUE(candump_a.has_state());
+  EXPECT_TRUE(candump_b.has_state());
+  EXPECT_FALSE(candump_a.state);
+  EXPECT_FALSE(candump_b.state);
+}
+
+TEST_F(TopTronicTest, DebugSwitchesOfEveryHubFollowTheirLog) {
+  this->set_now_(1000);
+  NullCanbus other_bus;
+  TestableTopTronic other_hub{&other_bus};
+  switch_::ApplySwitch<apply_candump> candump_a, candump_b;
+  switch_::ApplySwitch<apply_find_can_id> find_a;
+  for (switch_::Switch *sw : {static_cast<switch_::Switch *>(&candump_a), static_cast<switch_::Switch *>(&candump_b),
+                              static_cast<switch_::Switch *>(&find_a)})
+    sw->restore_mode = switch_::SWITCH_ALWAYS_OFF;
+  this->hub_.set_candump_switch(&candump_a);
+  this->hub_.set_find_can_id_switch(&find_a);
+  other_hub.set_candump_switch(&candump_b);
+
+  candump_a.turn_on();
+  EXPECT_TRUE(TestableTopTronic::is_candump_enabled());
+  EXPECT_FALSE(TestableTopTronic::is_find_can_id_enabled());
+  EXPECT_TRUE(candump_a.state);
+  EXPECT_TRUE(candump_b.state);
+  EXPECT_FALSE(find_a.state);
+
+  // The automatic turn off reaches every switch of that log
+  this->set_now_(122000);
+  TestableTopTronic::log_frame(START_ID, {0x00, 0x42}, false);
+  EXPECT_FALSE(candump_a.state);
+  EXPECT_FALSE(candump_b.state);
+
+  TestableTopTronic::set_find_can_id_enabled(true);
+  EXPECT_TRUE(find_a.state);
+  EXPECT_FALSE(candump_a.state);
 }
 #endif
 

@@ -12,6 +12,8 @@
 namespace esphome::toptronic {
 
 ESPHOME_LOG_TAG(TAG, "toptronic");
+// Own tag so a capture can be filtered out of the normal log
+ESPHOME_LOG_TAG(CANDUMP_TAG, "candump");
 
 static constexpr uint8_t RESPONSE = 0x42;
 // Extended RESPONSE for larger values (cleaning and maintenance counters): the 0x42 layout with two extra
@@ -23,7 +25,6 @@ static constexpr uint8_t SET_REQ = 0x46;
 // Continuation CAN ids clear bits 28-22.
 static constexpr size_t MAX_FIRST_FRAME_PAYLOAD = 6;
 static constexpr uint32_t CONTINUATION_ID_MASK = 0x003FFFFF;
-static constexpr uint8_t START_OF_MESSAGE_ID = 0x1F;
 static constexpr size_t MIN_MESSAGE_LEN = 5;  // cmd | fg | fn | dp_hi | dp_lo
 static constexpr size_t CRC_LEN = 2;
 static constexpr size_t CAN_FRAME_LEN = 8;
@@ -35,8 +36,14 @@ static constexpr uint16_t DEVICE_ADDR_MASK = 0x3F;
 static constexpr uint32_t REFRESH_STAGGER_MS = 15000;
 // A refresh with no GET sent or answered for this long plus the retry interval is abandoned
 static constexpr uint32_t REFRESH_STALL_TIMEOUT_MS = 5000;
+// Debug logs are temporary and turn themselves off after this long
+static constexpr uint32_t DEBUG_AUTO_OFF_MS = 120000;
+// Minimum time between two candump lines for received frames, so a busy bus cannot flood the API log stream
+static constexpr uint32_t CANDUMP_MIN_LOG_GAP_MS = 33;
 static constexpr uint32_t BOOT_REFRESH_TIMEOUT_ID = 0;
 static constexpr uint32_t REFRESH_ALL_TIMEOUT_ID = 1;
+// One id per debug log, DEBUG_AUTO_OFF_TIMEOUT_ID + DebugLog
+static constexpr uint32_t DEBUG_AUTO_OFF_TIMEOUT_ID = 2;
 static_assert((GATEWAY_DEVICE_TYPE & DEVICE_ADDR_MASK) == 0, "gateway type must leave the address bits clear");
 
 static constexpr uint16_t sender_id(uint32_t can_id) { return (can_id >> 11) & 0x7FF; }
@@ -70,10 +77,26 @@ static constexpr size_t build_set_request(uint8_t function_group, uint8_t functi
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 StaticVector<TopTronic *, TopTronic::MAX_HUBS> TopTronic::hubs;
 bool TopTronic::boot_refresh_done{false};
+std::array<TopTronic::DebugLogState, TopTronic::DEBUG_LOG_COUNT> TopTronic::debug_logs{};
+uint32_t TopTronic::last_candump_log_ms{0};
+uint32_t TopTronic::candump_dropped{0};
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 TopTronic::TopTronic(canbus::Canbus *canbus, uint16_t device_id) : canbus_(canbus), device_id_(device_id) {
   hubs.push_back(this);
+  // Log every frame once per bus: a second hub on the same bus must not add a second logger
+  bool bus_already_logged = false;
+  for (TopTronic *hub : hubs) {
+    if (hub != this && hub->canbus_ == canbus) {
+      bus_already_logged = true;
+      break;
+    }
+  }
+  if (!bus_already_logged) {
+    canbus->add_callback([](uint32_t can_id, bool, bool, const std::vector<uint8_t> &data) {
+      log_debug_frame(can_id, data.data(), data.size(), false);
+    });
+  }
   canbus->add_callback([this](uint32_t can_id, bool extended_id, bool rtr, const std::vector<uint8_t> &data) {
     // A remote frame has no payload; the bytes passed with it are left over from an earlier frame
     if (rtr || this->paused_ || !extended_id || sender_id(can_id) != this->device_id_)
@@ -242,6 +265,7 @@ void TopTronic::register_sensor_callbacks() {
         return;
       const auto &data = sensor->get_request_data();
       this->canbus_->send_data(can_id, true, false, data.data(), data.size());
+      log_debug_frame(can_id, data.data(), data.size(), true);
       ESP_LOGD_HEX(TAG, data.data(), data.size(), GET_REQUEST_LEN, "[GET] dev 0x%04X Data: %s", this->device_id_);
     });
   }
@@ -253,8 +277,11 @@ void TopTronic::register_sensor_callbacks() {
 //   continuation frames:       [tag, next 7 payload bytes]
 // The payload ends with a CRC-16 (poly 0x1021, init 0xB006, reflected) sent big endian.
 canbus::Error TopTronic::send_frames_(uint32_t can_id, const uint8_t *data, size_t len) {
-  if (len <= CAN_FRAME_LEN)
-    return this->canbus_->send_data(can_id, true, false, data, len);
+  if (len <= CAN_FRAME_LEN) {
+    const canbus::Error result = this->canbus_->send_data(can_id, true, false, data, len);
+    log_debug_frame(can_id, data, len, true);
+    return result;
+  }
   uint8_t msg_header = (++this->msg_counter_ == 0) ? ++this->msg_counter_ : this->msg_counter_;
   // Drop the single-frame header byte, append the CRC
   uint8_t msg[MAX_SET_REQUEST_LEN - 1 + CRC_LEN];
@@ -272,6 +299,7 @@ canbus::Error TopTronic::send_frames_(uint32_t can_id, const uint8_t *data, size
   frame[1] = msg_header;
   std::memcpy(frame + 2, msg, first_chunk);
   canbus::Error result = this->canbus_->send_data(can_id, true, false, frame, first_chunk + 2);
+  log_debug_frame(can_id, frame, first_chunk + 2, true);
   const uint32_t cont_id = can_id & CONTINUATION_ID_MASK;
   for (size_t offset = first_chunk; offset < msg_len;) {
     const size_t chunk = std::min(MAX_CONT_FRAME_PAYLOAD, msg_len - offset);
@@ -279,6 +307,7 @@ canbus::Error TopTronic::send_frames_(uint32_t can_id, const uint8_t *data, size
     std::memcpy(frame + 1, msg + offset, chunk);
     offset += chunk;
     const canbus::Error err = this->canbus_->send_data(cont_id, true, false, frame, chunk + 1);
+    log_debug_frame(cont_id, frame, chunk + 1, true);
     if (result == canbus::ERROR_OK)
       result = err;
   }
@@ -495,6 +524,16 @@ void TopTronic::setup() {
 #ifdef USE_OTA_STATE_LISTENER
   ota::get_global_ota_callback()->add_global_state_listener(this);
 #endif
+#ifdef USE_SWITCH
+  // The debug switches are plain Switch objects that publish nothing on their own, so send the
+  // boot state here instead of leaving them unknown in Home Assistant
+  for (TopTronic *hub : hubs) {
+    for (size_t i = 0; i < DEBUG_LOG_COUNT; i++) {
+      if (hub->debug_switches_[i] != nullptr)
+        hub->debug_switches_[i]->publish_state(debug_logs[i].enabled);
+    }
+  }
+#endif
   ESP_LOGI(TAG, "Hub 0x%04X (%zu sensors, %zu inputs)", (unsigned) this->device_id_, this->sensors_.size(),
            this->inputs_.size());
 }
@@ -516,6 +555,76 @@ void TopTronic::on_ota_global_state(ota::OTAState state, float progress, uint8_t
 }
 #endif
 
+void TopTronic::set_debug_log(DebugLog log, bool enabled) {
+  DebugLogState &state = debug_logs[log];
+  if (state.enabled != enabled) {
+    state.enabled = enabled;
+    const LogString *name = log == DEBUG_LOG_CANDUMP ? LOG_STR("CAN dump") : LOG_STR("Find CAN id");
+    const uint32_t timeout_id = DEBUG_AUTO_OFF_TIMEOUT_ID + log;
+    if (enabled) {
+      state.start_ms = App.get_loop_component_start_time();
+      // The frame path checks the deadline too, in case a flood of frames holds up the scheduler
+      if (!hubs.empty())
+        hubs[0]->set_timeout(timeout_id, DEBUG_AUTO_OFF_MS, [log]() { set_debug_log(log, false); });
+      ESP_LOGW(TAG, "%s debug log on, turns off in %" PRIu32 " s", LOG_STR_ARG(name), DEBUG_AUTO_OFF_MS / 1000);
+    } else {
+      if (!hubs.empty())
+        hubs[0]->cancel_timeout(timeout_id);
+      ESP_LOGW(TAG, "%s debug log off", LOG_STR_ARG(name));
+    }
+  }
+#ifdef USE_SWITCH
+  // Published even without a change, so a switch turned on after an automatic turn off still shows the state
+  for (TopTronic *hub : hubs) {
+    if (hub->debug_switches_[log] != nullptr)
+      hub->debug_switches_[log]->publish_state(enabled);
+  }
+#endif
+}
+
+bool TopTronic::debug_log_active(DebugLog log, uint32_t now) {
+  const DebugLogState &state = debug_logs[log];
+  if (!state.enabled)
+    return false;
+  if (now - state.start_ms <= DEBUG_AUTO_OFF_MS)
+    return true;
+  set_debug_log(log, false);
+  return false;
+}
+
+void TopTronic::log_debug_frame(uint32_t can_id, const uint8_t *data, size_t len, bool sent) {
+  if (!debug_logs[DEBUG_LOG_CANDUMP].enabled && !debug_logs[DEBUG_LOG_FIND_CAN_ID].enabled)
+    return;
+  const uint32_t now = App.get_loop_component_start_time();
+  if (debug_log_active(DEBUG_LOG_CANDUMP, now)) {
+    // Sent frames are few and a capture needs every request, so only received frames are rate limited.
+    // Skipped frames are counted and reported with the next line.
+    if (!sent && now - last_candump_log_ms < CANDUMP_MIN_LOG_GAP_MS) {
+      candump_dropped++;
+    } else {
+      if (!sent)
+        last_candump_log_ms = now;
+      char hex[format_hex_pretty_size(CAN_FRAME_LEN)];
+      format_hex_pretty_to(hex, data, len, ' ');
+      if (candump_dropped > 0) {
+        ESP_LOGI(CANDUMP_TAG, "0x%08" PRIX32 " : %s (%" PRIu32 " frames dropped)", can_id, hex, candump_dropped);
+        candump_dropped = 0;
+      } else {
+        ESP_LOGI(CANDUMP_TAG, "0x%08" PRIX32 " : %s", can_id, hex);
+      }
+    }
+  }
+  // Only a single frame message carries the command at [1]; a start frame holds the tag there and a
+  // continuation frame an arbitrary payload byte. Warning level, so logger.on_message can catch it.
+  if (!sent && debug_log_active(DEBUG_LOG_FIND_CAN_ID, now) && is_single_frame_message(can_id, data, len)) {
+    if (data[1] == RESPONSE || data[1] == GET_REQ) {
+      ESP_LOGW(TAG, "Find CAN id: %s frame, node 0x%03X (Can-ID 0x%08" PRIX32 ")",
+               data[1] == RESPONSE ? LOG_STR_LITERAL("response") : LOG_STR_LITERAL("request"), sender_id(can_id),
+               can_id);
+    }
+  }
+}
+
 void TopTronic::dump_config() {
   // The setters clamp these to the build-wide limits, so this prints what actually applies
   ESP_LOGCONFIG(TAG, "TopTronic:");
@@ -531,6 +640,10 @@ void TopTronic::dump_config() {
                 "  Refresh: boot delay %" PRIu32 " ms, one GET every %" PRIu32 " ms, %u retries after %" PRIu32 " ms",
                 this->boot_refresh_delay_ms_, this->refresh_interval_ms_, this->max_refresh_retries_,
                 this->refresh_retry_interval_ms_);
+#ifdef USE_SWITCH
+  LOG_SWITCH("  ", "CAN dump", this->debug_switches_[DEBUG_LOG_CANDUMP]);
+  LOG_SWITCH("  ", "Find CAN id", this->debug_switches_[DEBUG_LOG_FIND_CAN_ID]);
+#endif
 }
 
 bool TopTronic::parse_frame_(const uint8_t *data, size_t size, uint32_t can_id, const uint8_t **msg, size_t *len) {

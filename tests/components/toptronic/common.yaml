@@ -13,6 +13,14 @@ toptronic:
     max_refresh_retries: 0
     refresh_retry_interval: 250ms
 
+switch:
+  - platform: toptronic
+    toptronic_id: tt_hv
+    candump:
+      name: CAN dump
+    find_can_id:
+      name: Find CAN id
+
 # The hub pauses CAN traffic while an OTA update runs, so the listener path must compile
 wifi:
   ssid: MySSID
