@@ -1,32 +1,34 @@
 from dataclasses import dataclass, field
+import logging
 import pathlib
 
 import yaml
 
 import esphome.codegen as cg
-from esphome.components import ota
+from esphome.components import button as button_platform, ota
 from esphome.components.canbus import CONF_CANBUS_ID, CanbusComponent
 from esphome.components.const import CONF_DEVICE_TYPE
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_NAME, CONF_OPTIONS, CONF_PLATFORM
+from esphome.const import (
+    CONF_ENTITY_CATEGORY,
+    CONF_ICON,
+    CONF_ID,
+    CONF_NAME,
+    CONF_OPTIONS,
+    CONF_PLATFORM,
+)
 from esphome.core import CORE, ID
 from esphome.cpp_types import Component
 from esphome.types import ConfigType
 
+_LOGGER = logging.getLogger(__name__)
+
+# button: the generated "Refresh all" button is always built
+AUTO_LOAD = ["button", "sensor"]
 CODEOWNERS = ["@nliaudat"]
 DEPENDENCIES = ["canbus"]
 DOMAIN = "toptronic"
 MULTI_CONF = True
-
-
-def AUTO_LOAD(config: list[ConfigType] | None = None) -> list[str]:
-    """Load the button platform only when a hub's preset ships buttons."""
-    if not config or any(
-        (PRESETS_DIR / _preset_device_type(conf) / "buttons_en.yaml").exists()
-        for conf in config
-    ):
-        return ["sensor", "button"]
-    return ["sensor"]
 
 
 CONF_TOPTRONIC_ID = "toptronic_id"
@@ -36,6 +38,7 @@ CONF_FUNCTION_NUMBER = "function_number"
 CONF_DATAPOINT = "datapoint"
 CONF_DECIMAL = "decimal"
 CONF_VALUES = "values"
+CONF_LANGUAGE = "language"
 CONF_MAX_PENDING_MESSAGES = "max_pending_messages"
 CONF_MAX_FRAMES_PER_MESSAGE = "max_frames_per_message"
 CONF_MAX_PENDING_AGE = "max_pending_age"
@@ -46,9 +49,9 @@ CONF_REFRESH_INTERVAL = "refresh_interval"
 CONF_MAX_REFRESH_RETRIES = "max_refresh_retries"
 CONF_REFRESH_RETRY_INTERVAL = "refresh_retry_interval"
 
+LANGS = ("de", "en", "fr", "it")
 # The main loop runs every 16 ms, so a shorter GET spacing is not achievable
 REFRESH_INTERVAL_MIN_MS = 16
-
 # Platforms that read a datapoint: one entity per datapoint per hub, or the first would never be polled
 READ_DOMAINS = ("sensor", "text_sensor")
 # Platforms that write a datapoint: one entity per datapoint per hub, or the first write would never be sent
@@ -84,12 +87,6 @@ def validate_device_type(value: object) -> str:
     return cv.enum(DEVICE_TYPES)(DEVICE_TYPE_ALIASES.get(value, value))
 
 
-def _preset_device_type(conf: ConfigType) -> str:
-    """Return the preset directory of a hub config, before or after validation."""
-    value = str(conf.get(CONF_DEVICE_TYPE, "")).upper()
-    return DEVICE_TYPE_ALIASES.get(value, value)
-
-
 PRESETS_DIR = pathlib.Path(__file__).parent / "presets"
 _PRESETS_KEY = "toptronic_used_ids"
 
@@ -104,6 +101,9 @@ class TopTronicData:
     generated_entities: dict[str, list[tuple[str, ConfigType]]] = field(
         default_factory=dict
     )
+    # Validated build-wide "Refresh all" button config, and whether a hub emitted it
+    refresh_button: ConfigType | None = None
+    refresh_button_generated: bool = False
 
 
 def _get_data() -> TopTronicData:
@@ -164,6 +164,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_DEVICE_TYPE): validate_device_type,
         # Device types are 64 apart, so a larger address would alias the next type
         cv.Required(CONF_DEVICE_ADDR): cv.int_range(min=0, max=63),
+        cv.Optional(CONF_LANGUAGE, default="en"): cv.one_of(*LANGS, lower=True),
         # Each pending message is a fixed reassembly slot of max_frames_per_message * 7 bytes
         cv.Optional(CONF_MAX_PENDING_MESSAGES, default=2): cv.int_range(min=1, max=16),
         # The 5-bit frame count field allows at most 31 frames
@@ -205,6 +206,7 @@ _request_hub = cg.slot_counter("TOPTRONIC_HUB_COUNT")
 def _final_validate(config: ConfigType) -> None:
     """Generate and validate this hub's preset entities at validation time."""
     _register_preset_entities(config)
+    _register_refresh_button()
     _reject_duplicate_datapoints(config)
     _reject_mismatched_links(config)
 
@@ -212,13 +214,33 @@ def _final_validate(config: ConfigType) -> None:
 FINAL_VALIDATE_SCHEMA = _final_validate
 
 
-def _load_entities(device_type: str):
+def _load_entities(device_type: str, language: str):
+    """Load the preset files for one device type and language.
+
+    Presets are shipped per language. Each kind falls back to English on its own
+    when the requested language has no file for it, so a partial translation never
+    drops the rest of the corpus, and a warning names the file that fell back so a
+    missing translation is visible instead of silently yielding no entities.
+    """
+    directory = PRESETS_DIR / device_type
+    kinds = ("sensors", "inputs", "buttons")
+
     entities = []
-    for kind in ("sensors", "inputs", "buttons"):
-        path = PRESETS_DIR / device_type / f"{kind}_en.yaml"
+    for kind in kinds:
+        path = directory / f"{kind}_{language}.yaml"
         if not path.exists():
-            continue
-        with pathlib.Path(path).open(encoding="utf-8") as f:
+            path = directory / f"{kind}_en.yaml"
+            if not path.exists():
+                continue
+            if language != "en":
+                _LOGGER.warning(
+                    "No toptronic %s presets for device type %s in language '%s', "
+                    "falling back to 'en'",
+                    kind,
+                    device_type,
+                    language,
+                )
+        with path.open(encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         for platform_name, entries in data.items():
             entities.extend((platform_name, dict(entry)) for entry in entries or [])
@@ -282,11 +304,33 @@ def _register_preset_entities(config: ConfigType) -> None:
     }
     used_ids = _shared_used_ids()
     generated = []
-    for platform_name, entity_conf in _load_entities(config[CONF_DEVICE_TYPE]):
+
+    # Two hubs of the same device type would otherwise generate identically
+    # named preset entities, which ESPHome rejects. Qualify the names with the
+    # device type and address only when that ambiguity exists, so the common
+    # single-hub names stay unchanged.
+    from esphome import final_validate as fv
+
+    same_type = [
+        hub
+        for hub in fv.full_config.get().get(DOMAIN) or []
+        if str(hub.get(CONF_DEVICE_TYPE, "")).upper() == config[CONF_DEVICE_TYPE]
+    ]
+    prefix = (
+        f"{config[CONF_DEVICE_TYPE]} {config[CONF_DEVICE_ADDR]}: "
+        if len(same_type) > 1
+        else ""
+    )
+
+    for platform_name, entity_conf in _load_entities(
+        config[CONF_DEVICE_TYPE], config[CONF_LANGUAGE]
+    ):
         if platform_name not in platforms:
             raise cv.Invalid(
                 f"Unsupported platform '{platform_name}' in toptronic preset"
             )
+        if prefix and (name := entity_conf.get(CONF_NAME)) is not None:
+            entity_conf[CONF_NAME] = f"{prefix}{name}"
         entity_conf.pop("platform", None)
         entity_conf.pop(CONF_DEVICE_TYPE, None)
         entity_conf.pop(CONF_DEVICE_ADDR, None)
@@ -395,6 +439,35 @@ async def _generate_entities(hub, config: ConfigType) -> None:
         await codegens[platform_name](validated)
 
 
+def _register_refresh_button() -> None:
+    """Validate and register the build-wide "Refresh all" button.
+
+    Like the preset entities, its ID is resolved during final validation and
+    the validated config is stashed in CORE.data for to_code.
+    """
+    if (data := _get_data()).refresh_button is not None:
+        return
+    cfg = button_platform.button_schema(button_platform.ApplyButton)(
+        {
+            CONF_NAME: "Refresh all",
+            CONF_ICON: "mdi:refresh",
+            CONF_ENTITY_CATEGORY: "config",
+        }
+    )
+    _resolve_ids(cfg, _shared_used_ids())
+    data.refresh_button = cfg
+
+
+async def _generate_refresh_button(hub) -> None:
+    """Emit the "Refresh all" button once, on the first hub; refresh_all() covers every hub."""
+    data = _get_data()
+    if (cfg := data.refresh_button) is None or data.refresh_button_generated:
+        return
+    data.refresh_button_generated = True
+    buttons = button_platform.sub_buttons({}, parent=hub)
+    await buttons.create(cfg, None, apply="refresh_all()")
+
+
 async def to_code(config: ConfigType) -> None:
     cbus = await cg.get_variable(config[CONF_CANBUS_ID])
     device_id = DEVICE_TYPES[config[CONF_DEVICE_TYPE]] | config[CONF_DEVICE_ADDR]
@@ -419,3 +492,4 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_max_refresh_retries(config[CONF_MAX_REFRESH_RETRIES]))
     cg.add(var.set_refresh_retry_interval_ms(config[CONF_REFRESH_RETRY_INTERVAL]))
     await _generate_entities(var, config)
+    await _generate_refresh_button(var)

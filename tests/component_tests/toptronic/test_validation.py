@@ -7,6 +7,7 @@ from esphome.components.toptronic import (
     CONF_DEVICE_TYPE,
     CONF_FUNCTION_GROUP,
     CONF_FUNCTION_NUMBER,
+    CONF_LANGUAGE,
     CONF_TOPTRONIC_ID,
     CONF_VALUES,
     _final_validate,
@@ -33,7 +34,7 @@ COORDS = {
     CONF_FUNCTION_NUMBER: 0,
     CONF_DATAPOINT: 40652,
 }
-HUB_CONFIG = {CONF_ID: ID(HUB), CONF_DEVICE_TYPE: "HV"}
+HUB_CONFIG = {CONF_ID: ID(HUB), CONF_DEVICE_TYPE: "HV", CONF_LANGUAGE: "en"}
 
 
 def _entity(**extra: object) -> dict:
