@@ -13,6 +13,9 @@
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
+#ifdef USE_BUTTON
+#include "esphome/components/button/button.h"
+#endif
 #ifdef USE_SWITCH
 #include "esphome/components/switch/switch.h"
 #endif
@@ -30,7 +33,7 @@ namespace esphome::toptronic {
 
 class TopTronic;
 enum TypeName { U8, U16, U32, S8, S16, S32, S64 };  // value encoding of a datapoint
-enum SensorType { SENSOR, TEXTSENSOR };             // downcast discriminator (no dynamic_cast in ESPHome builds)
+enum SensorType { SENSOR, TEXTSENSOR, BUTTON };     // downcast discriminator (no dynamic_cast in ESPHome builds)
 
 static constexpr size_t GET_REQUEST_LEN = 6;
 using GetRequest = std::array<uint8_t, GET_REQUEST_LEN>;
@@ -43,18 +46,15 @@ static constexpr uint32_t REFRESH_INTERVAL_MIN_MS = 16;
 // CAN id prefix that marks the start frame of a message
 static constexpr uint8_t START_OF_MESSAGE_ID = 0x1F;
 
-// Shared entity base. update() fires the GET wired up by the hub.
-class TopTronicBase : public PollingComponent {
+// Addressing shared by every entity. A read entity adds PollingComponent on top; a write entity is a
+// plain entity, so it costs no Component slot and no polling lifecycle.
+class TopTronicBase {
  public:
   void set_function_group(uint8_t function_group) { this->function_group_ = function_group; }
   void set_function_number(uint8_t function_number) { this->function_number_ = function_number; }
   void set_datapoint(uint16_t datapoint) { this->datapoint_ = datapoint; }
   uint32_t get_id();  // fg | fn << 8 | datapoint << 16; hub map key
-  const GetRequest &get_request_data() const { return this->request_data_; }
-  void cache_request_data();
   virtual SensorType type() = 0;
-  void update() override;
-  void add_on_update_callback(std::function<void()> &&callback);
   virtual const LogString *get_log_name() const = 0;
   // Set once a complete RESPONSE arrived; unlocks writes to this datapoint (reject_writes_before_read)
   void mark_read() { this->read_ = true; }
@@ -64,12 +64,10 @@ class TopTronicBase : public PollingComponent {
   uint8_t function_group_;
   uint8_t function_number_;
   uint16_t datapoint_;
-  GetRequest request_data_{};  // GET payload, built once at setup
   bool read_{false};
-  CallbackManager<void()> update_callback_;
 };
 
-// Entity that can write to its datapoint. Only number and select derive from it, so read-only
+// Entity that can write to its datapoint. Only number, select and button derive from it, so read-only
 // sensors do not carry the write state.
 class TopTronicInput : public TopTronicBase {
  public:
@@ -93,9 +91,24 @@ class TopTronicInput : public TopTronicBase {
   /// Builds the SET request for value (scaled, rounded and clamped to type) and hands it to the hub.
   /// Returns whether the hub sent it: paused, rate limited, rejected or failed on the bus return false.
   bool send_set_(float value, TypeName type);
+  /// Same for an integer value, which keeps the full range of the 32 and 64 bit types
+  bool send_set_raw_(int64_t value, TypeName type);
 };
 
-class TopTronicSensor : public sensor::Sensor, public TopTronicBase {
+// A read entity: the hub polls it with a GET, and update() fires the callback that sends it.
+class TopTronicPolled : public TopTronicBase, public PollingComponent {
+ public:
+  void update() override;
+  const GetRequest &get_request_data() const { return this->request_data_; }
+  void cache_request_data();
+  void add_on_update_callback(std::function<void()> &&callback);
+
+ protected:
+  GetRequest request_data_{};  // GET payload, built once at setup
+  CallbackManager<void()> update_callback_;
+};
+
+class TopTronicSensor : public sensor::Sensor, public TopTronicPolled {
  public:
   void set_type(TypeName type) { this->type_ = type; }
   float parse_value(const uint8_t *data, size_t len);
@@ -110,7 +123,6 @@ class TopTronicSensor : public sensor::Sensor, public TopTronicBase {
 #ifdef USE_NUMBER
 class TopTronicNumber : public number::Number, public TopTronicInput {
  public:
-  TopTronicNumber() { this->set_update_interval(SCHEDULER_DONT_RUN); }
   void set_type(TypeName type) { this->type_ = type; }
   void set_multiplier(float multiplier) { this->multiplier_ = multiplier; }
   float get_multiplier() { return this->multiplier_; }
@@ -124,7 +136,7 @@ class TopTronicNumber : public number::Number, public TopTronicInput {
 };
 #endif
 #ifdef USE_TEXT_SENSOR
-class TopTronicTextSensor : public text_sensor::TextSensor, public TopTronicBase {
+class TopTronicTextSensor : public text_sensor::TextSensor, public TopTronicPolled {
  public:
   /// Returns the text for a value, or nullptr when it is not in the option list. The caller then
   /// keeps the last state instead of publishing an invalid one.
@@ -144,7 +156,6 @@ class TopTronicTextSensor : public text_sensor::TextSensor, public TopTronicBase
 #ifdef USE_SELECT
 class TopTronicSelect : public select::Select, public TopTronicInput {
  public:
-  TopTronicSelect() { this->set_update_interval(SCHEDULER_DONT_RUN); }
   void set_type(TypeName type) { this->type_ = type; }
   SensorType type() override { return TEXTSENSOR; }
   const LogString *get_log_name() const override { return this->select::Select::get_log_name(); }
@@ -153,6 +164,23 @@ class TopTronicSelect : public select::Select, public TopTronicInput {
  protected:
   void control(size_t index) override;
   std::vector<uint8_t> values_;  // SET value per option index, in the same order as the options
+  TypeName type_{U8};
+};
+#endif
+
+#ifdef USE_BUTTON
+// Sends a fixed SET (an acknowledge or reset command) when pressed. Never polls, like number and select.
+class TopTronicButton : public button::Button, public TopTronicInput {
+ public:
+  void set_type(TypeName type) { this->type_ = type; }
+  void set_value(int64_t value) { this->value_ = value; }
+  SensorType type() override { return BUTTON; }
+  const LogString *get_log_name() const override { return this->button::Button::get_log_name(); }
+
+ protected:
+  void press_action() override { this->send_set_raw_(this->value_, this->type_); }
+
+  int64_t value_{0};
   TypeName type_{U8};
 };
 #endif
@@ -167,7 +195,7 @@ class TopTronic : public Component
   // Also registers the hub for refresh_all(), before any setup() runs
   TopTronic(canbus::Canbus *canbus, uint16_t device_id);
 
-  void add_sensor(TopTronicBase *sensor);
+  void add_sensor(TopTronicPolled *sensor);
   void add_input(TopTronicInput *input);
   void register_sensor_callbacks();
   /// Sends a SET request for an input after the write guards.
@@ -277,7 +305,7 @@ class TopTronic : public Component
   }
 
   struct RefreshEntry {
-    TopTronicBase *sensor;
+    TopTronicPolled *sensor;
     uint32_t last_send_ms;
     uint8_t attempts;  // GETs sent for this sensor in the current refresh
   };
@@ -304,14 +332,14 @@ class TopTronic : public Component
   void link_inputs_();
   void drain_refresh_();
   void finish_refresh_(bool stalled);
-  void remove_refresh_entry_(TopTronicBase *sensor);
-  TopTronicBase *get_sensor_(uint32_t sensor_id);
+  void remove_refresh_entry_(TopTronicPolled *sensor);
+  TopTronicPolled *get_sensor_(uint32_t sensor_id);
 
   canbus::Canbus *canbus_;
 #ifdef USE_SWITCH
   std::array<switch_::Switch *, DEBUG_LOG_COUNT> debug_switches_{};
 #endif
-  std::unordered_map<uint32_t, TopTronicBase *> sensors_;
+  std::unordered_map<uint32_t, TopTronicPolled *> sensors_;
   std::unordered_map<uint32_t, TopTronicInput *> inputs_;
   std::array<Slot, NUM_SLOTS> slots_{};
   // Sensors whose refresh GET is still unanswered, oldest send first; sized in setup()

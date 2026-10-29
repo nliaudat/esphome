@@ -111,13 +111,13 @@ TopTronic::TopTronic(canbus::Canbus *canbus, uint16_t device_id) : canbus_(canbu
 uint32_t TopTronicBase::get_id() {
   return this->function_group_ + (this->function_number_ << 8) + (static_cast<uint32_t>(this->datapoint_) << 16);
 }
-void TopTronicBase::cache_request_data() {
+void TopTronicPolled::cache_request_data() {
   this->request_data_ = build_get_request(this->function_group_, this->function_number_, this->datapoint_);
 }
-void TopTronicBase::add_on_update_callback(std::function<void()> &&callback) {
+void TopTronicPolled::add_on_update_callback(std::function<void()> &&callback) {
   this->update_callback_.add(std::move(callback));
 }
-void TopTronicBase::update() { this->update_callback_.call(); }
+void TopTronicPolled::update() { this->update_callback_.call(); }
 
 template<typename T> T bytes_to_number(const uint8_t *data, size_t len) {
   uint64_t u = 0;
@@ -143,10 +143,9 @@ static size_t type_width(TypeName type) {
   return 1;
 }
 
-// Writes value big endian into out and returns its width. Rounds before narrowing (a scaled 21.5 must
-// not become 21.4) and clamps to the wire type so an out-of-range write cannot wrap to an unrelated value.
-static size_t float_to_bytes(float value, TypeName type, uint8_t *out) {
-  int64_t v = static_cast<int64_t>(llroundf(value));
+// Writes v big endian into out and returns its width. Clamps to the wire type so an out-of-range
+// write cannot wrap to an unrelated value.
+static size_t int_to_bytes(int64_t v, TypeName type, uint8_t *out) {
   switch (type) {
     case U8:
       v = std::clamp<int64_t>(v, 0, UINT8_MAX);
@@ -175,14 +174,19 @@ static size_t float_to_bytes(float value, TypeName type, uint8_t *out) {
   return width;
 }
 
+// Rounds before narrowing, so a scaled 21.5 does not become 21.4
 bool TopTronicInput::send_set_(float value, TypeName type) {
+  return this->send_set_raw_(static_cast<int64_t>(llroundf(value)), type);
+}
+
+bool TopTronicInput::send_set_raw_(int64_t value, TypeName type) {
   uint8_t bytes[MAX_SET_VALUE_LEN];
-  const size_t width = float_to_bytes(value, type, bytes);
+  const size_t width = int_to_bytes(value, type, bytes);
   SetRequest data{};
   const size_t len =
       build_set_request(this->function_group_, this->function_number_, this->datapoint_, bytes, width, data);
-  ESP_LOGD_HEX(TAG, data.data(), len, MAX_SET_REQUEST_LEN, "[SET] %s: %f, Data: %s", LOG_STR_ARG(this->get_log_name()),
-               value);
+  ESP_LOGD_HEX(TAG, data.data(), len, MAX_SET_REQUEST_LEN, "[SET] %s: %" PRId64 ", Data: %s",
+               LOG_STR_ARG(this->get_log_name()), value);
   // Without a hub there is nothing to send through, and nothing was sent
   return this->hub_ != nullptr && this->hub_->write(this, data.data(), len);
 }
@@ -235,7 +239,7 @@ void TopTronicSelect::control(size_t index) {
 }
 #endif
 
-void TopTronic::add_sensor(TopTronicBase *sensor) {
+void TopTronic::add_sensor(TopTronicPolled *sensor) {
   const uint32_t id = sensor->get_id();
   if (auto existing = this->sensors_.find(id); existing != this->sensors_.end()) {
     // Config validation rejects two read entities on one datapoint, so only external components get here
@@ -444,7 +448,7 @@ void TopTronic::finish_refresh_(bool stalled) {
   }
 }
 
-void TopTronic::remove_refresh_entry_(TopTronicBase *sensor) {
+void TopTronic::remove_refresh_entry_(TopTronicPolled *sensor) {
   auto *it = std::find_if(this->refresh_queue_.begin(), this->refresh_queue_.end(),
                           [sensor](const RefreshEntry &entry) { return entry.sensor == sensor; });
   if (it == this->refresh_queue_.end())
@@ -455,7 +459,7 @@ void TopTronic::remove_refresh_entry_(TopTronicBase *sensor) {
   this->last_refresh_progress_ms_ = App.get_loop_component_start_time();
 }
 
-TopTronicBase *TopTronic::get_sensor_(uint32_t sensor_id) {
+TopTronicPolled *TopTronic::get_sensor_(uint32_t sensor_id) {
   auto it = this->sensors_.find(sensor_id);
   return it == this->sensors_.end() ? nullptr : it->second;
 }
@@ -463,6 +467,8 @@ TopTronicBase *TopTronic::get_sensor_(uint32_t sensor_id) {
 void TopTronic::link_inputs_() {
   for (const auto &i : this->inputs_) {
     auto *input = i.second;
+    if (input->type() == BUTTON)
+      continue;  // nothing to sync for a fire-and-forget command
     auto *sensor_base = this->get_sensor_(input->get_id());
     if (sensor_base == nullptr) {
       // A write-only input (for example a select with no readback) is valid, so this
@@ -770,7 +776,7 @@ void TopTronic::interpret_message_(const uint8_t *data, size_t len) {
     ESP_LOGD(TAG, "[DROP] No sensor for fg=%u fn=%u dp=%u", data[1], data[2], datapoint);
     return;
   }
-  TopTronicBase *sensor_base = sensor_it->second;
+  TopTronicPolled *sensor_base = sensor_it->second;
   const size_t value_len = len - value_off;
   size_t required_value_len = 1;
   if (sensor_base->type() == SENSOR)
