@@ -13,11 +13,21 @@ from esphome.core import CORE, ID
 from esphome.cpp_types import Component
 from esphome.types import ConfigType
 
-AUTO_LOAD = ["number", "select", "sensor", "text_sensor"]
 CODEOWNERS = ["@nliaudat"]
 DEPENDENCIES = ["canbus"]
 DOMAIN = "toptronic"
 MULTI_CONF = True
+
+
+def AUTO_LOAD(config: list[ConfigType] | None = None) -> list[str]:
+    """Load the button platform only when a hub's preset ships buttons."""
+    if not config or any(
+        (PRESETS_DIR / _preset_device_type(conf) / "buttons_en.yaml").exists()
+        for conf in config
+    ):
+        return ["sensor", "button"]
+    return ["sensor"]
+
 
 CONF_TOPTRONIC_ID = "toptronic_id"
 CONF_DEVICE_ADDR = "device_addr"
@@ -41,6 +51,8 @@ REFRESH_INTERVAL_MIN_MS = 16
 
 # Platforms that read a datapoint: one entity per datapoint per hub, or the first would never be polled
 READ_DOMAINS = ("sensor", "text_sensor")
+# Platforms that write a datapoint: one entity per datapoint per hub, or the first write would never be sent
+WRITE_DOMAINS = ("number", "select", "button")
 # A write entity takes its state from the read entity on the same datapoint, so the kinds have to match
 LINKED_DOMAINS = {"number": "sensor", "select": "text_sensor"}
 
@@ -70,6 +82,12 @@ DEVICE_TYPE_ALIASES = {"BD": "BM"}
 def validate_device_type(value: object) -> str:
     value = cv.string(value).upper()
     return cv.enum(DEVICE_TYPES)(DEVICE_TYPE_ALIASES.get(value, value))
+
+
+def _preset_device_type(conf: ConfigType) -> str:
+    """Return the preset directory of a hub config, before or after validation."""
+    value = str(conf.get(CONF_DEVICE_TYPE, "")).upper()
+    return DEVICE_TYPE_ALIASES.get(value, value)
 
 
 PRESETS_DIR = pathlib.Path(__file__).parent / "presets"
@@ -253,13 +271,14 @@ def _register_preset_entities(config: ConfigType) -> None:
 
     The validated configs are stashed in CORE.data for to_code to generate.
     """
-    from . import number, select, sensor, text_sensor
+    from . import button, number, select, sensor, text_sensor
 
     platforms = {
         "sensor": sensor.CONFIG_SCHEMA,
         "text_sensor": text_sensor.CONFIG_SCHEMA,
         "number": number.CONFIG_SCHEMA,
         "select": select.CONFIG_SCHEMA,
+        "button": button.CONFIG_SCHEMA,
     }
     used_ids = _shared_used_ids()
     generated = []
@@ -318,19 +337,27 @@ def _hub_datapoints(
 
 
 def _reject_duplicate_datapoints(config: ConfigType) -> None:
-    """Reject two read entities on one datapoint of this hub.
+    """Reject two entities of the same direction on one datapoint of this hub.
 
-    A write entity (number, select, switch) may share the datapoint with a read
-    entity, it never lands in the hub's sensor map. Two read entities would
-    share one map slot, so the first would never be polled and would stay
-    unknown for good.
+    A read entity and a write entity may share a datapoint: the write takes its
+    state from the read one and does not land in the hub's sensor map. Two read
+    entities would share one map slot, so the first would never be polled and
+    would stay unknown for good. Two write entities share one input slot, so the
+    first would never send its value.
     """
+    _reject_duplicates(config, READ_DOMAINS, "read", "would never receive a value")
+    _reject_duplicates(config, WRITE_DOMAINS, "written", "would never send a value")
+
+
+def _reject_duplicates(
+    config: ConfigType, domains: tuple[str, ...], verb: str, reason: str
+) -> None:
     seen: dict[tuple[int, int, int], str] = {}
-    for key, _, source in _hub_datapoints(str(config[CONF_ID]), READ_DOMAINS):
+    for key, _, source in _hub_datapoints(str(config[CONF_ID]), domains):
         if (first := seen.get(key)) is not None:
             raise cv.Invalid(
-                f"Datapoint {key[2]} of function {key[0]}/{key[1]} is already read by "
-                f"{first}; {source} would never receive a value"
+                f"Datapoint {key[2]} of function {key[0]}/{key[1]} is already {verb} "
+                f"by {first}; {source} {reason}"
             )
         seen[key] = source
 
@@ -354,13 +381,14 @@ def _reject_mismatched_links(config: ConfigType) -> None:
 
 async def _generate_entities(hub, config: ConfigType) -> None:
     """Generate the preset entities validated during final validation."""
-    from . import number, select, sensor, text_sensor
+    from . import button, number, select, sensor, text_sensor
 
     codegens = {
         "sensor": sensor.to_code,
         "text_sensor": text_sensor.to_code,
         "number": number.to_code,
         "select": select.to_code,
+        "button": button.to_code,
     }
     saved = _get_data().generated_entities.get(str(config[CONF_ID]), [])
     for platform_name, validated in saved:

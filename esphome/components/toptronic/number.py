@@ -16,9 +16,7 @@ from . import (
     toptronic,
 )
 
-TopTronicNumber = toptronic.class_(
-    "TopTronicNumber", number.Number, cg.PollingComponent
-)
+TopTronicNumber = toptronic.class_("TopTronicNumber", number.Number)
 
 
 def _validate_min_max(config: ConfigType) -> ConfigType:
@@ -55,7 +53,6 @@ async def to_code(config):
         max_value=config[CONF_MAX_VALUE] / divider,
         step=config[CONF_STEP] / divider,
     )
-    await cg.register_component(var, config)
 
     cg.add(var.set_function_group(config[CONF_FUNCTION_GROUP]))
     cg.add(var.set_function_number(config[CONF_FUNCTION_NUMBER]))

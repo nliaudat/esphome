@@ -752,6 +752,43 @@ TEST_F(TopTronicTest, DebugSwitchesOfEveryHubFollowTheirLog) {
 }
 #endif
 
+#ifdef USE_BUTTON
+TEST_F(TopTronicTest, ButtonSendsItsSetRequestWithoutAReadback) {
+  // A write-only datapoint is not held back by the read guard
+  TopTronicButton button;
+  button.set_function_group(0);
+  button.set_function_number(0);
+  button.set_datapoint(21054);
+  button.set_type(U8);
+  button.set_value(7);
+  this->hub_.add_input(&button);
+  button.press();
+  ASSERT_EQ(this->bus_.sent.size(), 1u);
+  const auto &frame = this->bus_.sent[0];
+  ASSERT_EQ(frame.can_data_length_code, 7);
+  EXPECT_EQ(std::vector<uint8_t>(frame.data, frame.data + 7),
+            (std::vector<uint8_t>{0x01, 0x46, 0, 0, 21054 >> 8, 21054 & 0xFF, 7}));
+}
+
+TEST_F(TopTronicTest, ButtonKeepsTheFullRangeOfAnUnsignedType) {
+  TopTronicButton button;
+  button.set_function_group(0);
+  button.set_function_number(0);
+  button.set_datapoint(0);
+  button.set_type(U32);
+  button.set_value(0xFFFFFFFE);
+  this->hub_.add_input(&button);
+  button.press();
+  ASSERT_EQ(this->bus_.sent.size(), 2u);
+  const auto &start = this->bus_.sent[0];
+  const auto &cont = this->bus_.sent[1];
+  EXPECT_TRUE(
+      this->hub_.feed(start.can_id, std::vector<uint8_t>(start.data, start.data + start.can_data_length_code)).empty());
+  EXPECT_EQ(this->hub_.feed(cont.can_id, std::vector<uint8_t>(cont.data, cont.data + cont.can_data_length_code)),
+            (std::vector<uint8_t>{0x46, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFE}));
+}
+#endif
+
 #ifdef USE_NUMBER
 TEST_F(TopTronicTest, WriteOnlyNumberPublishesTheWrittenValue) {
   TopTronicNumber number;

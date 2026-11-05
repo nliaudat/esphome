@@ -1,4 +1,4 @@
-# Defines USE_SENSOR, USE_NUMBER, USE_SELECT, USE_SWITCH and USE_TEXT_SENSOR;
+# Defines USE_BUTTON, USE_SENSOR, USE_NUMBER, USE_SELECT, USE_SWITCH and USE_TEXT_SENSOR;
 # the tests attach their own instances
 sensor:
   - platform: template
@@ -32,3 +32,8 @@ switch:
     id: bench_switch
     name: "Switch"
     optimistic: true
+
+button:
+  - platform: template
+    id: bench_button
+    name: "Button"
