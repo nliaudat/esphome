@@ -13,6 +13,9 @@
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
+#ifdef USE_SWITCH
+#include "esphome/components/switch/switch.h"
+#endif
 #ifdef USE_OTA_STATE_LISTENER
 #include "esphome/components/ota/ota_backend.h"
 #endif
@@ -37,6 +40,8 @@ static constexpr size_t MAX_SET_REQUEST_LEN = GET_REQUEST_LEN + MAX_SET_VALUE_LE
 using SetRequest = std::array<uint8_t, MAX_SET_REQUEST_LEN>;
 // The main loop runs every 16 ms, so a shorter spacing between two refresh GETs is not achievable
 static constexpr uint32_t REFRESH_INTERVAL_MIN_MS = 16;
+// CAN id prefix that marks the start frame of a message
+static constexpr uint8_t START_OF_MESSAGE_ID = 0x1F;
 
 // Shared entity base. update() fires the GET wired up by the hub.
 class TopTronicBase : public PollingComponent {
@@ -204,6 +209,19 @@ class TopTronic : public Component
   void set_write_min_interval_ms(uint32_t ms) { this->write_min_interval_ms_ = ms; }
   void set_reject_writes_before_read(bool reject) { this->reject_writes_before_read_ = reject; }
 
+  // CAN traffic logs, shared by every hub of the build: candump logs every frame sent or received, find_can_id
+  // logs the sender of every single-frame GET (0x40) and RESPONSE (0x42) message. Both are off at boot and turn off
+  // after DEBUG_AUTO_OFF_MS.
+  static void set_candump_enabled(bool enabled) { set_debug_log(DEBUG_LOG_CANDUMP, enabled); }
+  static void set_find_can_id_enabled(bool enabled) { set_debug_log(DEBUG_LOG_FIND_CAN_ID, enabled); }
+  static bool is_candump_enabled() { return debug_logs[DEBUG_LOG_CANDUMP].enabled; }
+  static bool is_find_can_id_enabled() { return debug_logs[DEBUG_LOG_FIND_CAN_ID].enabled; }
+#ifdef USE_SWITCH
+  // The switches of every hub follow the log state, including an automatic turn off
+  void set_candump_switch(switch_::Switch *sw) { this->debug_switches_[DEBUG_LOG_CANDUMP] = sw; }
+  void set_find_can_id_switch(switch_::Switch *sw) { this->debug_switches_[DEBUG_LOG_FIND_CAN_ID] = sw; }
+#endif
+
   // Stop and restart polling and frame processing, for example during an OTA update
   void pause();
   void resume();
@@ -237,6 +255,27 @@ class TopTronic : public Component
   static StaticVector<TopTronic *, MAX_HUBS> hubs;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
   static bool boot_refresh_done;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+  enum DebugLog : uint8_t { DEBUG_LOG_CANDUMP, DEBUG_LOG_FIND_CAN_ID, DEBUG_LOG_COUNT };
+  struct DebugLogState {
+    uint32_t start_ms;
+    bool enabled;
+  };
+  // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+  static std::array<DebugLogState, DEBUG_LOG_COUNT> debug_logs;
+  static uint32_t last_candump_log_ms;
+  static uint32_t candump_dropped;  // received frames skipped by the candump rate limit since the last line
+  // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+  static void set_debug_log(DebugLog log, bool enabled);
+  /// Turns off a debug log that has run past DEBUG_AUTO_OFF_MS; returns whether it is still on.
+  static bool debug_log_active(DebugLog log, uint32_t now);
+  /// Logs a frame seen on the bus or sent by this node, for whichever debug logs are on.
+  static void log_debug_frame(uint32_t can_id, const uint8_t *data, size_t len, bool sent);
+  /// True for a start frame with a frame count of 0, the only shape whose [1] byte is a command.
+  static bool is_single_frame_message(uint32_t can_id, const uint8_t *data, size_t len) {
+    return len >= 2 && (can_id >> 24) == START_OF_MESSAGE_ID && (data[0] >> 3) == 0;
+  }
+
   struct RefreshEntry {
     TopTronicBase *sensor;
     uint32_t last_send_ms;
@@ -269,6 +308,9 @@ class TopTronic : public Component
   TopTronicBase *get_sensor_(uint32_t sensor_id);
 
   canbus::Canbus *canbus_;
+#ifdef USE_SWITCH
+  std::array<switch_::Switch *, DEBUG_LOG_COUNT> debug_switches_{};
+#endif
   std::unordered_map<uint32_t, TopTronicBase *> sensors_;
   std::unordered_map<uint32_t, TopTronicInput *> inputs_;
   std::array<Slot, NUM_SLOTS> slots_{};
