@@ -1,16 +1,64 @@
 #pragma once
 
 #include "esphome/components/canbus/canbus.h"
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 
 #include <array>
+#include <unordered_map>
+#include <vector>
 
 namespace esphome::toptronic {
+
+class TopTronic;
+enum TypeName { U8, U16, U32, S8, S16, S32, S64 };  // value encoding of a datapoint
+enum SensorType { SENSOR };                         // downcast discriminator (no dynamic_cast in ESPHome builds)
+
+static constexpr size_t GET_REQUEST_LEN = 6;
+using GetRequest = std::array<uint8_t, GET_REQUEST_LEN>;
+
+// Shared entity base. update() fires the GET wired up by the hub.
+class TopTronicBase : public PollingComponent {
+ public:
+  void set_function_group(uint8_t function_group) { this->function_group_ = function_group; }
+  void set_function_number(uint8_t function_number) { this->function_number_ = function_number; }
+  void set_datapoint(uint16_t datapoint) { this->datapoint_ = datapoint; }
+  uint32_t get_id();  // fg | fn << 8 | datapoint << 16; hub map key
+  const GetRequest &get_request_data() const { return this->request_data_; }
+  void cache_request_data();
+  virtual SensorType type() = 0;
+  void update() override;
+  void add_on_update_callback(std::function<void()> &&callback);
+  virtual const LogString *get_log_name() const = 0;
+
+ protected:
+  uint8_t function_group_;
+  uint8_t function_number_;
+  uint16_t datapoint_;
+  GetRequest request_data_{};  // GET payload, built once at setup
+  CallbackManager<void()> update_callback_;
+};
+
+class TopTronicSensor : public sensor::Sensor, public TopTronicBase {
+ public:
+  void set_type(TypeName type) { this->type_ = type; }
+  float parse_value(const uint8_t *data, size_t len);
+  size_t value_width() const;
+  SensorType type() override { return SENSOR; }
+  const LogString *get_log_name() const override { return this->sensor::Sensor::get_log_name(); }
+
+ protected:
+  TypeName type_;
+};
 
 class TopTronic : public Component {
  public:
   TopTronic(canbus::Canbus *canbus, uint16_t device_id);
 
+  void add_sensor(TopTronicBase *sensor);
+  void register_sensor_callbacks();
+  void setup() override;
   void dump_config() override;
 
  protected:
@@ -40,6 +88,8 @@ class TopTronic : public Component {
   bool parse_frame_(const uint8_t *data, size_t size, uint32_t can_id, const uint8_t **msg, size_t *len);
   void interpret_message_(const uint8_t *data, size_t len);
 
+  canbus::Canbus *canbus_;
+  std::unordered_map<uint32_t, TopTronicBase *> sensors_;
   std::array<Slot, NUM_SLOTS> slots_{};
   uint16_t device_id_;
 };

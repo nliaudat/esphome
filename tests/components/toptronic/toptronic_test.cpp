@@ -17,9 +17,9 @@ constexpr uint8_t TAG = 0x2A;
 // Sender field of the hub under test (0x208)
 constexpr uint32_t SENDER_BITS = 0x208u << 11;
 
-// Hands queued frames to the receive callbacks on loop()
-class QueueCanbus : public canbus::Canbus {
+class NullCanbus : public canbus::Canbus {
  public:
+  // Queues a received frame, handed to the callbacks on loop()
   void push(uint32_t can_id, bool rtr, const std::vector<uint8_t> &data) {
     canbus::CanFrame frame{};
     frame.use_extended_id = true;
@@ -27,26 +27,31 @@ class QueueCanbus : public canbus::Canbus {
     frame.can_id = can_id;
     frame.can_data_length_code = data.size();
     std::copy(data.begin(), data.end(), frame.data);
-    this->queue_.push_back(frame);
+    this->received_.push_back(frame);
   }
+
+  canbus::CanFrame last_sent{};
 
  protected:
   bool setup_internal() override { return true; }
-  canbus::Error send_message(canbus::CanFrame *) override { return canbus::ERROR_OK; }
+  canbus::Error send_message(canbus::CanFrame *frame) override {
+    this->last_sent = *frame;
+    return canbus::ERROR_OK;
+  }
   canbus::Error read_message(canbus::CanFrame *frame) override {
-    if (this->queue_.empty())
+    if (this->received_.empty())
       return canbus::ERROR_NOMSG;
-    *frame = this->queue_.front();
-    this->queue_.erase(this->queue_.begin());
+    *frame = this->received_.front();
+    this->received_.erase(this->received_.begin());
     return canbus::ERROR_OK;
   }
 
-  std::vector<canbus::CanFrame> queue_;
+  std::vector<canbus::CanFrame> received_;
 };
 
 class TestableTopTronic : public TopTronic {
  public:
-  explicit TestableTopTronic(canbus::Canbus *bus) : TopTronic(bus, 0x208) {}
+  explicit TestableTopTronic(canbus::Canbus *bus, uint16_t device_id = 0x208) : TopTronic(bus, device_id) {}
 
   // Feeds one frame; returns the completed payload, or an empty vector when nothing completed
   std::vector<uint8_t> feed(uint32_t can_id, const std::vector<uint8_t> &frame) {
@@ -56,6 +61,8 @@ class TestableTopTronic : public TopTronic {
       return {};
     return std::vector<uint8_t>(msg, msg + len);
   }
+
+  void interpret(const std::vector<uint8_t> &msg) { this->interpret_message_(msg.data(), msg.size()); }
 
   size_t live_slots(uint32_t now) const {
     size_t n = 0;
@@ -94,7 +101,7 @@ class TopTronicTest : public ::testing::Test {
     return frames;
   }
 
-  QueueCanbus bus_;
+  NullCanbus bus_;
   TestableTopTronic hub_{&this->bus_};
   uint32_t now_{1000};
 };
@@ -189,6 +196,68 @@ TEST_F(TopTronicTest, FrameCountOfOneIsRejected) {
   this->set_now_(1000);
   EXPECT_TRUE(this->hub_.feed(START_ID, {1 << 3, TAG, 0x42}).empty());
   EXPECT_EQ(this->hub_.live_slots(1000), 0u);
+}
+
+TEST_F(TopTronicTest, ResponsePublishesToTheMatchingSensor) {
+  TopTronicSensor sensor;
+  sensor.set_function_group(0x01);
+  sensor.set_function_number(0x02);
+  sensor.set_datapoint(0x9ECB);
+  sensor.set_type(U16);
+  this->hub_.add_sensor(&sensor);
+  // Another datapoint is ignored
+  this->hub_.interpret({0x42, 0x01, 0x02, 0x00, 0x10, 0x12, 0x34});
+  EXPECT_FALSE(sensor.has_state());
+  // A value shorter than the type is ignored
+  this->hub_.interpret({0x42, 0x01, 0x02, 0x9E, 0xCB, 0x12});
+  EXPECT_FALSE(sensor.has_state());
+  this->hub_.interpret({0x42, 0x01, 0x02, 0x9E, 0xCB, 0x12, 0x34});
+  EXPECT_FLOAT_EQ(sensor.state, 0x1234);
+  // The extended response carries two more header bytes before the value
+  this->hub_.interpret({0x56, 0x01, 0x02, 0x9E, 0xCB, 0x00, 0x00, 0x00, 0x2A});
+  EXPECT_FLOAT_EQ(sensor.state, 0x2A);
+}
+
+TEST_F(TopTronicTest, UpdateSendsGetRequestFromTheGateway) {
+  TopTronicSensor sensor;
+  sensor.set_function_group(50);
+  sensor.set_function_number(0);
+  sensor.set_datapoint(40651);
+  sensor.set_type(U8);
+  this->hub_.add_sensor(&sensor);
+  this->hub_.register_sensor_callbacks();
+  sensor.update();
+  const auto &frame = this->bus_.last_sent;
+  EXPECT_TRUE(frame.use_extended_id);
+  // Gateway type 1152 with the hub's address 8, sent to device 0x208
+  EXPECT_EQ(frame.can_id, (0x7Fu << 22) | ((1152u | 8u) << 11) | 0x208u);
+  ASSERT_EQ(frame.can_data_length_code, 6);
+  EXPECT_EQ(std::vector<uint8_t>(frame.data, frame.data + 6),
+            (std::vector<uint8_t>{0x01, 0x40, 50, 0, 40651 >> 8, 40651 & 0xFF}));
+}
+
+TEST_F(TopTronicTest, GatewaySenderIdKeepsTheHubAddress) {
+  NullCanbus bus_a;
+  NullCanbus bus_b;
+  TestableTopTronic hub_a{&bus_a, 0x201};  // HV at address 1
+  TestableTopTronic hub_b{&bus_b, 0x202};  // HV at address 2
+  TopTronicSensor sensor_a;
+  TopTronicSensor sensor_b;
+  for (auto *sensor : {&sensor_a, &sensor_b}) {
+    sensor->set_function_group(50);
+    sensor->set_function_number(0);
+    sensor->set_datapoint(40651);
+    sensor->set_type(U8);
+  }
+  hub_a.add_sensor(&sensor_a);
+  hub_a.register_sensor_callbacks();
+  hub_b.add_sensor(&sensor_b);
+  hub_b.register_sensor_callbacks();
+  sensor_a.update();
+  sensor_b.update();
+  // Neighbouring addresses must not share one gateway sender id
+  EXPECT_EQ((bus_a.last_sent.can_id >> 11) & 0x7FF, 1152u | 1u);
+  EXPECT_EQ((bus_b.last_sent.can_id >> 11) & 0x7FF, 1152u | 2u);
 }
 
 TEST_F(TopTronicTest, RemoteFrameDoesNotFeedReassembly) {
