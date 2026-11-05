@@ -7,10 +7,8 @@ ESPHOME_LOG_TAG(TAG, "ttp229_lsf");
 
 void TTP229LSFComponent::setup() {
   uint8_t data[2];
-  if (this->read(data, 2) != i2c::ERROR_OK) {
-    this->mark_failed(LOG_STR(ESP_LOG_MSG_COMM_FAIL));
+  if (!this->setup_check(this->read(data, 2) == i2c::ERROR_OK))
     return;
-  }
 }
 void TTP229LSFComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "ttp229:");
@@ -18,12 +16,9 @@ void TTP229LSFComponent::dump_config() {
 }
 void TTP229LSFComponent::loop() {
   uint16_t touched = 0;
-  if (this->read(reinterpret_cast<uint8_t *>(&touched), 2) != i2c::ERROR_OK) {
-    this->status_set_warning();
+  if (!this->status_comm_result(this->read(reinterpret_cast<uint8_t *>(&touched), 2) == i2c::ERROR_OK))
     return;
-  }
   touched = i2c::i2ctohs(touched);
-  this->status_clear_warning();
   touched = reverse_bits(touched);
   for (auto *channel : this->channels_) {
     channel->process(touched);

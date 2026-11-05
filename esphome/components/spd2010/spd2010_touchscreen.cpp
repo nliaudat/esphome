@@ -84,10 +84,9 @@ void SPD2010Touchscreen::setup() {
 
 void SPD2010Touchscreen::initialize_() {
   uint8_t version[18];
-  if (!this->read_register_(REG_VERSION, version, sizeof(version))) {
-    this->mark_failed(LOG_STR("Failed to read firmware version"));
+  if (!this->setup_check(this->read_register_(REG_VERSION, version, sizeof(version)),
+                         LOG_STR("Failed to read firmware version")))
     return;
-  }
   ESP_LOGD(TAG, "Firmware version: 0x%04X", encode_value_le<uint16_t>(&version[4]));
   if (this->interrupt_pin_ != nullptr) {
     this->interrupt_pin_->setup();
@@ -139,19 +138,12 @@ bool SPD2010Touchscreen::read_data_() {
     return false;
   }
   if ((status_high & STATUS_RUNNING) && length == 0) {
-    if (!this->clear_interrupt_()) {
-      this->status_set_warning(LOG_STR("Failed to clear interrupt"));
-      return false;
-    }
-    this->status_clear_warning();
-    return true;
+    return this->status_comm_result(this->clear_interrupt_(), LOG_STR("Failed to clear interrupt"));
   }
   if (!(status_low & (STATUS_POINT | STATUS_GESTURE))) {
-    if ((status_high & STATUS_RUNNING) && (status_low & STATUS_AUX) && !this->clear_interrupt_()) {
-      this->status_set_warning(LOG_STR("Failed to clear interrupt"));
-      return false;
-    }
-    this->status_clear_warning();
+    const bool needs_clear = (status_high & STATUS_RUNNING) && (status_low & STATUS_AUX);
+    const bool cleared = !needs_clear || this->clear_interrupt_();
+    this->status_comm_result(cleared, LOG_STR("Failed to clear interrupt"));
     return false;
   }
   if (length < REPORT_HEADER_LENGTH || length > MAX_REPORT_LENGTH ||
