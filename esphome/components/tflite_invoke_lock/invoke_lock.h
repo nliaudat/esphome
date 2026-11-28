@@ -11,7 +11,10 @@ inline Mutex &invoke_mutex() {
   return mutex;
 }
 /// Set on the task that holds invoke_mutex().
-inline thread_local bool holds_invoke_mutex = false;
+inline bool &holds_invoke_mutex() {
+  static thread_local bool holds = false;
+  return holds;
+}
 }  // namespace internal
 
 /// @brief Hold this around every tflite::MicroInterpreter::Invoke().
@@ -25,12 +28,12 @@ class InvokeLock {
     if (!this->acquired_)
       return;
     internal::invoke_mutex().lock();
-    internal::holds_invoke_mutex = true;
+    internal::holds_invoke_mutex() = true;
   }
   ~InvokeLock() {
     if (!this->acquired_)
       return;
-    internal::holds_invoke_mutex = false;
+    internal::holds_invoke_mutex() = false;
     internal::invoke_mutex().unlock();
   }
   InvokeLock(const InvokeLock &) = delete;
@@ -40,7 +43,7 @@ class InvokeLock {
 
   /// True while the calling task is invoking a model. Such a task must not block on another model's lock, whose
   /// owner may be waiting for this one.
-  static bool held_by_current_task() { return internal::holds_invoke_mutex; }
+  static bool held_by_current_task() { return internal::holds_invoke_mutex(); }
 
  private:
   const bool acquired_;
