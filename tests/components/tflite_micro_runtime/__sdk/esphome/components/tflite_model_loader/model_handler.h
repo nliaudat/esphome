@@ -40,6 +40,8 @@ class ModelHandler {
     auto &engine = tflite_runtime_testing::engine;
     this->output_value_ = static_cast<float>(++engine.invocations);
     this->output_.type = engine.output_type;
+    if (engine.during_invoke)
+      engine.during_invoke();
     return engine.invoke_status;
   }
   size_t input_count() const { return 1; }

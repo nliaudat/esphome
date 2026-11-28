@@ -11,7 +11,8 @@ from tests.testing_helpers import ComponentManifestOverride
 
 def override_manifest(manifest: ComponentManifestOverride) -> None:
     manifest.dependencies = ["host"]
-    manifest.auto_load = []
+    # Header only and used by the code under test, so its real sources are built
+    manifest.auto_load = ["tflite_invoke_lock"]
     manifest.config_schema = cv.Schema({})
     # A multi_conf component gets an empty list in the test build, so to_code would not run
     manifest.multi_conf = False

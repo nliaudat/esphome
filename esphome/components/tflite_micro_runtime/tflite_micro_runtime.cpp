@@ -2,6 +2,7 @@
 
 #ifdef USE_TFLITE_MICRO_HELPER
 #include "esphome/core/hal.h"
+#include "esphome/components/tflite_invoke_lock/invoke_lock.h"
 #include "esphome/core/log.h"
 #include <algorithm>
 #include <cinttypes>
@@ -10,6 +11,8 @@
 #include <esp_heap_caps.h>
 
 namespace esphome::tflite_micro_runtime {
+
+using tflite_invoke_lock::InvokeLock;
 
 ESPHOME_LOG_TAG(TAG, "tflite_micro_runtime");
 
@@ -47,17 +50,6 @@ bool has_classification_mapping(const TfLiteTensor *output) {
   return output->type == kTfLiteFloat32 || output->type == kTfLiteUInt8 || output->type == kTfLiteInt8;
 }
 
-/// One lock for every runtime: the optimized ESP-NN kernels keep their scratch
-/// buffers in globals, so two models must not invoke at the same time, whatever
-/// their own locks allow. A function static, so it exists before its first use.
-Mutex &shared_invoke_mutex() {
-  static Mutex mutex;
-  return mutex;
-}
-
-/// Task holding shared_invoke_mutex(), which is not recursive.
-std::atomic<TaskHandle_t> shared_invoke_owner{nullptr};
-
 }  // namespace
 
 TFLiteMicroHelper::LockGuard::LockGuard(const TFLiteMicroHelper *helper, bool wait) : helper_(helper) {
@@ -72,10 +64,10 @@ TFLiteMicroHelper::LockGuard::LockGuard(const TFLiteMicroHelper *helper, bool wa
     }
     return;
   }
-  // A task inside invoke() holds shared_invoke_mutex(), and the owner of this
-  // lock may be waiting for that one: a log callback reaching another model must
-  // not block here.
-  if (wait && shared_invoke_owner.load(std::memory_order_relaxed) != current) {
+  // A task inside invoke() holds the invoke lock, and the owner of this lock may
+  // be waiting for that one: a log callback reaching another model must not block
+  // here.
+  if (wait && !InvokeLock::held_by_current_task()) {
     this->helper_->mutex_.lock();
   } else if (!this->helper_->mutex_.try_lock()) {
     return;
@@ -252,7 +244,7 @@ void TFLiteMicroHelper::dispatch_result_() {
     return;
   // Reached from a log emitted during an invocation: the lock taken after the
   // callbacks might be refused, which would deliver the result twice. loop() does it.
-  if (shared_invoke_owner.load(std::memory_order_relaxed) == xTaskGetCurrentTaskHandle())
+  if (InvokeLock::held_by_current_task())
     return;
   uint32_t epoch = 0;
   {
@@ -340,17 +332,13 @@ TfLiteStatus TFLiteMicroHelper::invoke_locked_() {
     ESP_LOGE(TAG, "Cannot invoke -- model not loaded");
     return kTfLiteError;
   }
-  const TaskHandle_t current = xTaskGetCurrentTaskHandle();
-  if (shared_invoke_owner.load(std::memory_order_relaxed) == current) {
+  InvokeLock invoke_lock;
+  if (!invoke_lock.acquired()) {
     // A log emitted by a kernel can run an automation that invokes another model.
     ESP_LOGE(TAG, "Cannot invoke a model while this task is invoking another one");
     return kTfLiteError;
   }
-  esphome::LockGuard guard(shared_invoke_mutex());
-  shared_invoke_owner.store(current, std::memory_order_relaxed);
-  const TfLiteStatus status = this->model_handler_.invoke();
-  shared_invoke_owner.store(nullptr, std::memory_order_relaxed);
-  return status;
+  return this->model_handler_.invoke();
 }
 
 bool TFLiteMicroHelper::decode_outputs_locked_() {

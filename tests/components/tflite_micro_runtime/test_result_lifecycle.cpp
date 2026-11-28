@@ -168,6 +168,21 @@ TEST_F(ResultLifecycleTest, ASameTaskReentryIsRejectedInsteadOfDeadlocking) {
   EXPECT_EQ(this->helper.get_arena_used_bytes(), 128u);
 }
 
+TEST_F(ResultLifecycleTest, AnInvocationHoldsTheSharedLockAndRefusesANestedOne) {
+  TFLiteMicroHelper other;
+  ASSERT_TRUE(other.set_model(MODEL_DATA, sizeof(MODEL_DATA), 0));
+  ASSERT_TRUE(other.load_model());
+  engine.during_invoke = [&other]() {
+    engine.during_invoke = nullptr;
+    EXPECT_TRUE(tflite_invoke_lock::InvokeLock::held_by_current_task());
+    EXPECT_EQ(other.invoke(), kTfLiteError);
+  };
+  EXPECT_EQ(this->helper.invoke(), kTfLiteOk);
+  EXPECT_EQ(engine.invocations, 1u);
+  EXPECT_FALSE(tflite_invoke_lock::InvokeLock::held_by_current_task());
+  EXPECT_EQ(other.invoke(), kTfLiteOk);
+}
+
 TEST_F(ResultLifecycleTest, ADecoderRunDropsTheResultOfAnEarlierRun) {
   Decoder decoder;
   this->helper.set_output_decoder(&decoder);

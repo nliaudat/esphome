@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include "tensorflow/lite/c/common.h"
 
 namespace esphome::tflite_runtime_testing {
@@ -11,6 +12,7 @@ struct Engine {
   bool allocation_succeeds{true};
   unsigned invocations{0};
   unsigned unloads{0};
+  std::function<void()> during_invoke;
 };
 inline Engine engine;
 }  // namespace esphome::tflite_runtime_testing

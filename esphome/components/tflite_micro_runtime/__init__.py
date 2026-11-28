@@ -48,6 +48,7 @@ MAX_MODEL_TENSORS = 8
 
 # Library-only sub-components, auto-loaded so users only configure this component.
 AUTO_LOAD = [
+    "tflite_invoke_lock",
     "tflite_memory_handler",
     "tflite_model_debug",
     "tflite_model_io",
