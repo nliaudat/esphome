@@ -2,6 +2,7 @@
 
 #ifdef USE_ESP32
 
+#include "esphome/components/tflite_invoke_lock/invoke_lock.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include <cstring>
@@ -261,7 +262,13 @@ bool StreamingModel::perform_streaming_inference(const int8_t features[PREPROCES
     ++this->current_stride_step_;
 
     if (this->current_stride_step_ >= stride) {
-      TfLiteStatus invoke_status = this->interpreter_->Invoke();
+      TfLiteStatus invoke_status;
+      {
+        // Other interpreters share the kernels' scratch buffers. Only this task runs the wake word models, so the
+        // lock is never nested here.
+        tflite_invoke_lock::InvokeLock lock;
+        invoke_status = this->interpreter_->Invoke();
+      }
       if (invoke_status != kTfLiteOk) {
         ESP_LOGW(TAG, "Streaming interpreter invoke failed");
         return false;

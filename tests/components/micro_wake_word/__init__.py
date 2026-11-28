@@ -9,7 +9,8 @@ from tests.testing_helpers import ComponentManifestOverride
 
 def override_manifest(manifest: ComponentManifestOverride) -> None:
     manifest.dependencies = ["host"]
-    manifest.auto_load = []
+    # Header only and used by the code under test, so its real sources are built
+    manifest.auto_load = ["tflite_invoke_lock"]
     manifest.config_schema = cv.Schema({})
 
     async def to_code_testing(config: ConfigType) -> None:

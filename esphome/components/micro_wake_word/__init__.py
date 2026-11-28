@@ -37,7 +37,7 @@ from esphome.types import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
-AUTO_LOAD = ["ring_buffer"]
+AUTO_LOAD = ["ring_buffer", "tflite_invoke_lock"]
 CODEOWNERS = ["@kahrendt", "@jesserockz"]
 DEPENDENCIES = ["microphone"]
 
